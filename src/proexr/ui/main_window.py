@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
+from ..analysis.scopes import pixel_report
 from ..errors import ProexrError
 from ..media.frame import MediaSource
 from ..media.opener import open_media
@@ -36,6 +37,8 @@ from .color_panel import ColorPanel
 from .info_panel import InfoPanel
 from .media_list import MediaList
 from .ocio_panel import OcioPanel
+from .pixel_inspector import PixelInspector
+from .scopes_panel import ScopesPanel
 from .timeline import Timeline
 from .transport_bar import SPEEDS, TransportBar
 from .viewer import Channel, CompareMode, Viewer, ViewTransform
@@ -44,6 +47,8 @@ CACHE_SIZES_GB = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64)
 DEFAULT_CACHE_SHARE = 0.3
 MAX_DEFAULT_CACHE_GB = 16
 STATUS_INTERVAL_MS = 250
+SCOPE_INTERVAL_MS = 120
+SCOPE_SAMPLE_WIDTH = 384
 EXPOSURE_NUDGE = 0.5
 EMPTY_HINT = "Drop images, EXR sequences, videos or folders here\n\nCtrl+O open file    Ctrl+Shift+O open folder"
 FILE_FILTER = ("Media (*.exr *.sxr *.png *.jpg *.jpeg *.tif *.tiff *.tga *.dpx *.cin *.hdr *.bmp *.psd *.webp "
@@ -193,12 +198,24 @@ class MainWindow(QMainWindow):
                                     self.settings.value("ocio_view"))
         self.ocio_panel.lutChanged.connect(self._apply_display_lut)
         self.viewer.set_display_lut(self.ocio_panel.current_lut())
+        self.scopes_panel = ScopesPanel()
+        self.viewer.displaySampled.connect(self.scopes_panel.show_sample)
+        self.pixel_inspector = PixelInspector()
         self.media_dock = self._add_dock("Media", self.media_list, Qt.LeftDockWidgetArea, "media_dock")
         self.color_dock = self._add_dock("Color", self.color_panel, Qt.RightDockWidgetArea, "color_dock")
         self.ocio_dock = self._add_dock("Color management", self.ocio_panel, Qt.RightDockWidgetArea, "ocio_dock")
         self.info_dock = self._add_dock("Info", self.info_panel, Qt.RightDockWidgetArea, "info_dock")
         self.tabifyDockWidget(self.color_dock, self.ocio_dock)
         self.color_dock.raise_()
+        self.scopes_dock = self._add_dock("Scopes", self.scopes_panel, Qt.BottomDockWidgetArea, "scopes_dock")
+        self.inspector_dock = self._add_dock("Pixel", self.pixel_inspector, Qt.RightDockWidgetArea, "inspector_dock")
+        self.tabifyDockWidget(self.info_dock, self.inspector_dock)
+        self.info_dock.raise_()
+        self.scopes_dock.hide()
+        self._scope_timer = QTimer(self)
+        self._scope_timer.timeout.connect(self._sample_for_scopes)
+        self._scope_timer.start(SCOPE_INTERVAL_MS)
+        self._scoped_frame = None
         self.media_list.setMinimumWidth(230)
         self.color_panel.setMinimumWidth(320)
         self.resizeDocks([self.media_dock, self.color_dock], [250, 340], Qt.Horizontal)
@@ -303,6 +320,8 @@ class MainWindow(QMainWindow):
         panels.addAction(self.media_dock.toggleViewAction())
         panels.addAction(self.color_dock.toggleViewAction())
         panels.addAction(self.ocio_dock.toggleViewAction())
+        panels.addAction(self.scopes_dock.toggleViewAction())
+        panels.addAction(self.inspector_dock.toggleViewAction())
         panels.addAction(self.info_dock.toggleViewAction())
         reset_layout = QAction("Reset layout", self)
         reset_layout.triggered.connect(self._reset_layout)
@@ -659,10 +678,24 @@ class MainWindow(QMainWindow):
         if self.media_list.count():
             self.media_list.setCurrentRow((self.media_list.currentRow() + step) % self.media_list.count())
 
+    def _sample_for_scopes(self) -> None:
+        if not self.scopes_dock.isVisible() or self.viewer.frame is None:
+            return
+        signature = (id(self.viewer.frame), tuple(sorted((k, str(v)) for k, v in self.viewer.grade.items())),
+                     self.viewer.view_transform, self.viewer.channel, id(self.viewer.display_lut))
+        if signature != self._scoped_frame:
+            self._scoped_frame = signature
+            self.viewer.request_display_sample(SCOPE_SAMPLE_WIDTH)
+
     def _show_pixel(self, pixel: dict | None) -> None:
         if not pixel:
             self.pixel_label.setText("")
             return
+        frame = self.viewer.frame
+        if frame is not None and self.source is not None:
+            layer = self.source.layers[min(self.layer, len(self.source.layers) - 1)]
+            names = layer.channel_names if len(layer.channel_names) == frame.pixels.shape[2] else list("RGBA")
+            self.pixel_inspector.show_report(pixel_report(frame.pixels, pixel["x"], pixel["y"], names))
         values = pixel["values"]
         names = "RGBA" if len(values) > 1 else "V"
         text = "  ".join(f"{names[i]} {values[i]:.4f}" for i in range(len(values)))
@@ -690,7 +723,8 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
 
     def toggle_panels(self) -> None:
-        docks = (self.media_dock, self.color_dock, self.ocio_dock, self.info_dock)
+        docks = (self.media_dock, self.color_dock, self.ocio_dock, self.info_dock, self.scopes_dock,
+                 self.inspector_dock)
         hiding = self.view_bar.isVisible()
         if hiding:
             self._docks_before_hide = [d for d in docks if d.isVisible()]

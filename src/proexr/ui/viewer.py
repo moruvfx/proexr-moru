@@ -189,6 +189,7 @@ class Viewer(QOpenGLWidget):
     pixelHovered = Signal(object)
     zoomChanged = Signal(float)
     filesDropped = Signal(list)
+    displaySampled = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -220,6 +221,8 @@ class Viewer(QOpenGLWidget):
         self._drag_origin: tuple[QPointF, QPointF] | None = None
         self._mouse: QPointF | None = None
         self.display_lut: BakedLut | None = None
+        self._sample_width = 0
+        self._sample_target: tuple[int, int, int, int] | None = None
         self._lut_pending = False
         self._lut_texture = 0
 
@@ -241,6 +244,10 @@ class Viewer(QOpenGLWidget):
     @property
     def is_comparing(self) -> bool:
         return self.compare_mode is not CompareMode.OFF and self.compare_frame is not None
+
+    def request_display_sample(self, width: int) -> None:
+        self._sample_width = width
+        self.update()
 
     def set_display_lut(self, lut: BakedLut | None) -> None:
         self.display_lut = lut
@@ -327,13 +334,15 @@ class Viewer(QOpenGLWidget):
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, minify)
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, magnify)
 
-    def _set_uniforms(self, view_w: int, view_h: int, ratio: float) -> None:
+    def _set_uniforms(self, view_w: int, view_h: int, ratio: float, zoom: float | None = None,
+                      pan: QPointF | None = None) -> None:
         u, g = self._uniforms, self.grade
         image_w, image_h = self._display_size()
+        pan = self.pan * ratio if pan is None else pan
         GL.glUniform2f(u["imageSize"], image_w, image_h)
         GL.glUniform2f(u["viewSize"], view_w, view_h)
-        GL.glUniform2f(u["pan"], self.pan.x() * ratio, self.pan.y() * ratio)
-        GL.glUniform1f(u["zoom"], self.zoom * ratio)
+        GL.glUniform2f(u["pan"], pan.x(), pan.y())
+        GL.glUniform1f(u["zoom"], self.zoom * ratio if zoom is None else zoom)
         GL.glUniform1i(u["image"], 0)
         GL.glUniform1i(u["channelCount"], self._texture_signatures[0][2])
         compare = self.compare_frame if self.is_comparing and self._texture_signatures[1] else None
@@ -398,9 +407,47 @@ class Viewer(QOpenGLWidget):
                 self._set_uniforms(view_w, view_h, ratio)
                 GL.glUniform1i(self._uniforms["passSource"], 0)
                 GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+            if self._sample_width:
+                self._emit_display_sample(view_w, view_h)
             GL.glBindVertexArray(0)
             GL.glUseProgram(0)
         self._paint_overlays()
+
+    def _sample_framebuffer(self, width: int, height: int) -> int:
+        if self._sample_target is not None and self._sample_target[2:] == (width, height):
+            return self._sample_target[0]
+        if self._sample_target is not None:
+            GL.glDeleteFramebuffers(1, [self._sample_target[0]])
+            GL.glDeleteTextures([self._sample_target[1]])
+        texture = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, texture)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, width, height, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, None)
+        framebuffer = GL.glGenFramebuffers(1)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, framebuffer)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, texture, 0)
+        self._sample_target = (framebuffer, texture, width, height)
+        return framebuffer
+
+    def _emit_display_sample(self, view_w: int, view_h: int) -> None:
+        image_w, image_h = self._display_size()
+        width = self._sample_width
+        height = max(1, round(width * image_h / image_w))
+        self._sample_width = 0
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._sample_framebuffer(width, height))
+        GL.glViewport(0, 0, width, height)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[0])
+        self._set_uniforms(width, height, 1.0, zoom=width / image_w, pan=QPointF(0, 0))
+        GL.glUniform1i(self._uniforms["compareMode"], 0)
+        GL.glUniform1i(self._uniforms["passSource"], 0)
+        GL.glUniform1i(self._uniforms["showClipping"], 0)
+        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+        GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 1)
+        data = GL.glReadPixels(0, 0, width, height, GL.GL_RGB, GL.GL_UNSIGNED_BYTE)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        GL.glViewport(0, 0, view_w, view_h)
+        sample = np.frombuffer(data, np.uint8).reshape(height, width, 3)[::-1].copy()
+        self.displaySampled.emit(sample)
 
     def _paint_overlays(self) -> None:
         painter = QPainter(self)

@@ -136,3 +136,21 @@ def test_compare_shortcut_cycles_b_source(window, qapp, exr_sequence, video_file
     window.viewer.setFocus()
     QTest.keyClick(window.viewer, Qt.Key_B, Qt.ControlModifier)
     assert window.compare_source is window.media_list.sources()[1]
+
+
+def test_scopes_receive_display_samples(window, qapp, exr_sequence):
+    window.open_paths([str(exr_sequence)])
+    window.scopes_dock.show()
+    window.scopes_dock.raise_()
+    assert wait_for(qapp, lambda: window.scopes_panel.canvas.image is not None)
+    window.scopes_panel.mode_box.setCurrentText("Histogram")
+    assert window.scopes_panel.canvas.histogram is not None
+
+
+def test_pixel_inspector_reports_hovered_pixel(window, qapp, exr_sequence):
+    window.open_paths([str(exr_sequence)])
+    assert wait_for(qapp, lambda: window.viewer.frame is not None)
+    viewer = window.viewer
+    QTest.mouseMove(viewer, QPoint(viewer.width() // 2, viewer.height() // 2))
+    assert wait_for(qapp, lambda: "Luminance" in window.pixel_inspector.details.text())
+    assert "R " in window.pixel_inspector.details.text()

@@ -22,3 +22,6 @@ CLIP_OVER = QColor("#FF00FF")
 CLIP_UNDER = QColor("#0099FF")
 FONT_FAMILY = "Inter, Segoe UI, Arial, sans-serif"
 MONO_FAMILY = "Cascadia Mono, Consolas, DejaVu Sans Mono, monospace"
+SCOPE_RED = QColor(255, 90, 90, 220)
+SCOPE_GREEN = QColor(90, 230, 120, 220)
+SCOPE_BLUE = QColor(100, 150, 255, 220)

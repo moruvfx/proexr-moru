@@ -145,3 +145,18 @@ def test_compare_off_ignores_b(viewer, qapp):
     show_pair(viewer)
     viewer.compare_mode = CompareMode.OFF
     assert pixel_at(viewer, qapp, 0.6) == pytest.approx((255, 0, 0), abs=2)
+
+
+def test_display_sample_matches_what_is_shown(viewer, qapp):
+    samples = []
+    viewer.displaySampled.connect(samples.append)
+    viewer.show_frame(solid([0.18, 0.18, 0.18, 1.0]))
+    viewer.request_display_sample(64)
+    settle(qapp)
+    viewer.repaint()
+    settle(qapp)
+    assert samples, "no sample emitted"
+    sample = samples[-1]
+    assert sample.shape[1] == 64 and sample.shape[2] == 3
+    assert sample.shape[0] == pytest.approx(64 * 40 / 60, abs=1)
+    assert sample[5, 5] == pytest.approx((118, 118, 118), abs=2)
