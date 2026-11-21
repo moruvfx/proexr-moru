@@ -56,6 +56,12 @@ uniform int showClipping;
 uniform vec3 clipOver;
 uniform vec3 clipUnder;
 uniform sampler3D displayLut;
+uniform sampler2D imageB;
+uniform int channelCountB;
+uniform int sourceBIsSrgb;
+uniform int compareMode;
+uniform int passSource;
+uniform float wipeX;
 uniform int lutShaper;
 uniform float lutMin;
 uniform float lutMax;
@@ -84,13 +90,20 @@ vec3 applyLut(vec3 v) {
     return texture(displayLut, s * ((lutSize - 1.0) / lutSize) + 0.5 / lutSize).rgb;
 }
 
-void main() {
-    vec4 texel = texture(image, uv);
-    vec4 c = channelCount == 1 ? vec4(texel.rrr, 1.0)
-           : channelCount == 2 ? vec4(texel.rg, 0.0, 1.0)
-           : channelCount == 3 ? vec4(texel.rgb, 1.0)
+vec4 decode(vec4 texel, int count, int isSrgb) {
+    vec4 c = count == 1 ? vec4(texel.rrr, 1.0)
+           : count == 2 ? vec4(texel.rg, 0.0, 1.0)
+           : count == 3 ? vec4(texel.rgb, 1.0)
            : texel;
-    if (sourceIsSrgb == 1 && viewTransform != 4) c.rgb = srgbToLinear(c.rgb);
+    if (isSrgb == 1 && viewTransform != 4) c.rgb = srgbToLinear(c.rgb);
+    return c;
+}
+
+void main() {
+    vec4 c = decode(texture(image, uv), channelCount, sourceIsSrgb);
+    bool showB = passSource == 1 || compareMode == 1 || (compareMode == 2 && uv.x >= wipeX);
+    if (showB) c = decode(texture(imageB, uv), channelCountB, sourceBIsSrgb);
+    if (compareMode == 4) c = vec4(abs(c.rgb - decode(texture(imageB, uv), channelCountB, sourceBIsSrgb).rgb), 1.0);
 
     vec3 v = c.rgb * exp2(exposure) * gain * balance + offset;
     if (contrast != 1.0) v = sign(v) * pow(abs(v) / 0.18, vec3(contrast)) * 0.18;
@@ -118,7 +131,8 @@ void main() {
 
 UNIFORMS = ("imageSize", "viewSize", "pan", "zoom", "image", "channelCount", "sourceIsSrgb", "exposure",
             "gain", "offset", "contrast", "saturation", "balance", "gamma", "channel", "viewTransform",
-            "showClipping", "clipOver", "clipUnder", "displayLut", "lutShaper", "lutMin", "lutMax", "lutSize")
+            "showClipping", "clipOver", "clipUnder", "displayLut", "lutShaper", "lutMin", "lutMax", "lutSize",
+            "imageB", "channelCountB", "sourceBIsSrgb", "compareMode", "passSource", "wipeX")
 PIXEL_FORMATS = {1: GL.GL_RED, 2: GL.GL_RG, 3: GL.GL_RGB, 4: GL.GL_RGBA}
 TEXTURE_FORMATS = {
     np.dtype(np.uint8): (GL.GL_UNSIGNED_BYTE, {1: GL.GL_R8, 2: GL.GL_RG8, 3: GL.GL_RGB8, 4: GL.GL_RGBA8}),
@@ -131,6 +145,7 @@ MIN_ZOOM, MAX_ZOOM = 0.01, 256.0
 WHEEL_ZOOM_STEP = 1.2
 MIPMAP_BELOW_ZOOM = 0.75
 NEAREST_FROM_ZOOM = 2.0
+WIPE_GRAB_PIXELS = 10
 DEFAULT_GRADE = {"exposure": 0.0, "gain": 1.0, "offset": 0.0, "contrast": 1.0, "saturation": 1.0,
                  "balance": (1.0, 1.0, 1.0), "gamma": 1.0}
 
@@ -142,6 +157,14 @@ class Channel(IntEnum):
     BLUE = 3
     ALPHA = 4
     LUMINANCE = 5
+
+
+class CompareMode(IntEnum):
+    OFF = 0
+    B_ONLY = 1
+    WIPE = 2
+    SIDE_BY_SIDE = 3
+    DIFFERENCE = 4
 
 
 class ViewTransform(IntEnum):
@@ -174,6 +197,10 @@ class Viewer(QOpenGLWidget):
         self.setAcceptDrops(True)
         self.setMinimumSize(320, 200)
         self.frame: Frame | None = None
+        self.compare_frame: Frame | None = None
+        self.compare_mode = CompareMode.OFF
+        self.wipe_position = 0.5
+        self._is_dragging_wipe = False
         self.grade = dict(DEFAULT_GRADE)
         self.channel = Channel.RGB
         self.view_transform = ViewTransform.SRGB
@@ -186,9 +213,10 @@ class Viewer(QOpenGLWidget):
         self.pan = QPointF(0, 0)
         self.is_fit = True
         self.gl_renderer = ""
-        self._upload_pending = False
-        self._texture_signature: tuple | None = None
-        self._mipmaps_stale = True
+        self._textures = [0, 0]
+        self._uploads_pending = [False, False]
+        self._texture_signatures: list[tuple | None] = [None, None]
+        self._mipmaps_stale = [True, True]
         self._drag_origin: tuple[QPointF, QPointF] | None = None
         self._mouse: QPointF | None = None
         self.display_lut: BakedLut | None = None
@@ -199,11 +227,20 @@ class Viewer(QOpenGLWidget):
         size_changed = frame is None or self.frame is None or \
             (frame.width, frame.height) != (self.frame.width, self.frame.height)
         self.frame = frame
-        self._upload_pending = frame is not None
+        self._uploads_pending[0] = frame is not None
         if size_changed and self.is_fit:
             self._fit_zoom()
         self.update()
         self._report_pixel()
+
+    def show_compare_frame(self, frame: Frame | None) -> None:
+        self.compare_frame = frame
+        self._uploads_pending[1] = frame is not None
+        self.update()
+
+    @property
+    def is_comparing(self) -> bool:
+        return self.compare_mode is not CompareMode.OFF and self.compare_frame is not None
 
     def set_display_lut(self, lut: BakedLut | None) -> None:
         self.display_lut = lut
@@ -225,12 +262,12 @@ class Viewer(QOpenGLWidget):
         GL.glEnableVertexAttribArray(0)
         GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, ctypes.c_void_p(0))
         GL.glBindVertexArray(0)
-        self._texture = GL.glGenTextures(1)
+        self._textures = list(GL.glGenTextures(2))
         self._lut_texture = GL.glGenTextures(1)
         self._lut_pending = self.display_lut is not None
         self._uniforms = {name: GL.glGetUniformLocation(self._program, name) for name in UNIFORMS}
-        self._texture_signature = None
-        self._upload_pending = self.frame is not None
+        self._texture_signatures = [None, None]
+        self._uploads_pending = [self.frame is not None, self.compare_frame is not None]
         self.gl_renderer = GL.glGetString(GL.GL_RENDERER).decode(errors="replace")
 
     @staticmethod
@@ -248,22 +285,24 @@ class Viewer(QOpenGLWidget):
             raise RuntimeError(GL.glGetProgramInfoLog(program).decode())
         return program
 
-    def _upload(self, frame: Frame) -> None:
+    def _upload(self, slot: int, frame: Frame) -> None:
         pixels = frame.pixels if frame.pixels.dtype in TEXTURE_FORMATS else frame.pixels.astype(np.float32)
         gl_type, internal_formats = TEXTURE_FORMATS[pixels.dtype]
         height, width, channels = pixels.shape
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
+        GL.glActiveTexture(GL.GL_TEXTURE0 + (2 if slot else 0))
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[slot])
         GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
         signature = (width, height, channels, pixels.dtype)
-        if signature != self._texture_signature:
+        if signature != self._texture_signatures[slot]:
             GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, internal_formats[channels], width, height, 0,
                             PIXEL_FORMATS[channels], gl_type, pixels)
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
             GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-            self._texture_signature = signature
+            self._texture_signatures[slot] = signature
         else:
             GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, width, height, PIXEL_FORMATS[channels], gl_type, pixels)
-        self._mipmaps_stale = True
+        self._mipmaps_stale[slot] = True
+        GL.glActiveTexture(GL.GL_TEXTURE0)
 
     def _upload_lut(self, lut: BakedLut) -> None:
         size = lut.table.shape[0]
@@ -277,12 +316,12 @@ class Viewer(QOpenGLWidget):
             GL.glTexParameteri(GL.GL_TEXTURE_3D, wrap, GL.GL_CLAMP_TO_EDGE)
         GL.glActiveTexture(GL.GL_TEXTURE0)
 
-    def _set_filtering(self, device_zoom: float) -> None:
+    def _set_filtering(self, slot: int, device_zoom: float) -> None:
         minify = GL.GL_LINEAR
         if device_zoom < MIPMAP_BELOW_ZOOM:
-            if self._mipmaps_stale:
+            if self._mipmaps_stale[slot]:
                 GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
-                self._mipmaps_stale = False
+                self._mipmaps_stale[slot] = False
             minify = GL.GL_LINEAR_MIPMAP_LINEAR
         magnify = GL.GL_NEAREST if self.nearest_when_magnified and device_zoom >= NEAREST_FROM_ZOOM else GL.GL_LINEAR
         GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, minify)
@@ -296,7 +335,14 @@ class Viewer(QOpenGLWidget):
         GL.glUniform2f(u["pan"], self.pan.x() * ratio, self.pan.y() * ratio)
         GL.glUniform1f(u["zoom"], self.zoom * ratio)
         GL.glUniform1i(u["image"], 0)
-        GL.glUniform1i(u["channelCount"], self._texture_signature[2])
+        GL.glUniform1i(u["channelCount"], self._texture_signatures[0][2])
+        compare = self.compare_frame if self.is_comparing and self._texture_signatures[1] else None
+        GL.glUniform1i(u["imageB"], 2)
+        GL.glUniform1i(u["channelCountB"], self._texture_signatures[1][2] if compare else 4)
+        GL.glUniform1i(u["sourceBIsSrgb"], int(compare is not None and compare.colorspace == "srgb"))
+        mode = self.compare_mode if compare is not None else CompareMode.OFF
+        GL.glUniform1i(u["compareMode"], 0 if mode is CompareMode.SIDE_BY_SIDE else int(mode))
+        GL.glUniform1f(u["wipeX"], self.wipe_position)
         GL.glUniform1i(u["sourceIsSrgb"], int(self.frame.colorspace == "srgb"))
         GL.glUniform1f(u["exposure"], g["exposure"])
         GL.glUniform1f(u["gain"], g["gain"])
@@ -326,19 +372,32 @@ class Viewer(QOpenGLWidget):
         if self._lut_pending and self.display_lut is not None:
             self._upload_lut(self.display_lut)
             self._lut_pending = False
-        if self._upload_pending and self.frame is not None:
-            self._upload(self.frame)
-            self._upload_pending = False
-        if self.frame is not None and self._texture_signature is not None:
+        for slot, frame in enumerate((self.frame, self.compare_frame)):
+            if self._uploads_pending[slot] and frame is not None:
+                self._upload(slot, frame)
+                self._uploads_pending[slot] = False
+        if self.frame is not None and self._texture_signatures[0] is not None:
             GL.glUseProgram(self._program)
             GL.glActiveTexture(GL.GL_TEXTURE1)
             GL.glBindTexture(GL.GL_TEXTURE_3D, self._lut_texture)
-            GL.glActiveTexture(GL.GL_TEXTURE0)
-            GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
-            self._set_filtering(self.zoom * ratio)
-            self._set_uniforms(view_w, view_h, ratio)
+            for slot, unit in ((1, GL.GL_TEXTURE2), (0, GL.GL_TEXTURE0)):
+                GL.glActiveTexture(unit)
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[slot])
+                if self._texture_signatures[slot] is not None:
+                    self._set_filtering(slot, self.zoom * ratio)
             GL.glBindVertexArray(self._vao)
-            GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+            if self.is_comparing and self.compare_mode is CompareMode.SIDE_BY_SIDE:
+                half = view_w // 2
+                for index in (0, 1):
+                    GL.glViewport(index * half, 0, half, view_h)
+                    self._set_uniforms(half, view_h, ratio)
+                    GL.glUniform1i(self._uniforms["passSource"], index)
+                    GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+                GL.glViewport(0, 0, view_w, view_h)
+            else:
+                self._set_uniforms(view_w, view_h, ratio)
+                GL.glUniform1i(self._uniforms["passSource"], 0)
+                GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
             GL.glBindVertexArray(0)
             GL.glUseProgram(0)
         self._paint_overlays()
@@ -365,6 +424,8 @@ class Viewer(QOpenGLWidget):
                 painter.setPen(QPen(palette.GUIDE, 1))
                 painter.drawLine(cx - 12, cy, cx + 12, cy)
                 painter.drawLine(cx, cy - 12, cx, cy + 12)
+            if self.is_comparing:
+                self._paint_compare_marks(painter, left, top, right, bottom)
             if self.frame.is_held:
                 painter.setPen(palette.MISSING)
                 painter.drawText(12, 22, "Missing frame: holding previous")
@@ -373,14 +434,40 @@ class Viewer(QOpenGLWidget):
             painter.drawText(self.rect(), Qt.AlignCenter, self.hint)
         painter.end()
 
+    def _wipe_x(self) -> float:
+        left, _, right, _ = self._image_rect()
+        return left + (right - left) * self.wipe_position
+
+    def _paint_compare_marks(self, painter: QPainter, left: float, top: float, right: float, bottom: float) -> None:
+        painter.setPen(palette.TEXT)
+        if self.compare_mode is CompareMode.WIPE:
+            x = int(self._wipe_x())
+            painter.setPen(QPen(palette.TEXT, 2))
+            painter.drawLine(x, int(top), x, int(bottom))
+            painter.setBrush(palette.ACCENT)
+            painter.drawEllipse(QPointF(x, (top + bottom) / 2), 7, 7)
+            painter.drawText(int(left) + 8, int(top) + 18, "A")
+            painter.drawText(int(right) - 16, int(top) + 18, "B")
+        elif self.compare_mode is CompareMode.SIDE_BY_SIDE:
+            pane = self._pane_width()
+            painter.drawText(int(left) + 8, int(top) + 18, "A")
+            painter.drawText(int(left + pane) + 8, int(top) + 18, "B")
+        else:
+            label = "B" if self.compare_mode is CompareMode.B_ONLY else "A - B"
+            painter.drawText(int(left) + 8, int(top) + 18, label)
+
     def _display_size(self) -> tuple[float, float]:
         if self.frame is None:
             return 1.0, 1.0
         return self.frame.width * self.pixel_aspect, float(self.frame.height)
 
+    def _pane_width(self) -> float:
+        side_by_side = self.is_comparing and self.compare_mode is CompareMode.SIDE_BY_SIDE
+        return self.width() / 2 if side_by_side else float(self.width())
+
     def _image_rect(self) -> tuple[float, float, float, float]:
         width, height = self._display_size()
-        cx, cy = self.width() / 2 + self.pan.x(), self.height() / 2 + self.pan.y()
+        cx, cy = self._pane_width() / 2 + self.pan.x(), self.height() / 2 + self.pan.y()
         half_w, half_h = width * self.zoom / 2, height * self.zoom / 2
         return cx - half_w, cy - half_h, cx + half_w, cy + half_h
 
@@ -388,12 +475,13 @@ class Viewer(QOpenGLWidget):
         if self.frame is None:
             return None
         left, top, right, bottom = self._image_rect()
+        position = QPointF(position.x() % self._pane_width(), position.y())
         return ((position.x() - left) / (right - left) * self.frame.width,
                 (position.y() - top) / (bottom - top) * self.frame.height)
 
     def _fit_zoom(self) -> None:
         width, height = self._display_size()
-        self.zoom = min(self.width() / width, self.height() / height) * FIT_MARGIN
+        self.zoom = min(self._pane_width() / width, self.height() / height) * FIT_MARGIN
         self.pan = QPointF(0, 0)
         self.zoomChanged.emit(self.zoom)
 
@@ -405,7 +493,8 @@ class Viewer(QOpenGLWidget):
     def set_zoom(self, zoom: float, anchor: QPointF | None = None) -> None:
         zoom = min(max(zoom, MIN_ZOOM), MAX_ZOOM)
         if anchor is not None:
-            offset = anchor - QPointF(self.width() / 2, self.height() / 2) - self.pan
+            local = QPointF(anchor.x() % self._pane_width(), anchor.y())
+            offset = local - QPointF(self._pane_width() / 2, self.height() / 2) - self.pan
             self.pan = self.pan + offset - offset * (zoom / self.zoom)
         self.zoom = zoom
         self.is_fit = False
@@ -426,12 +515,22 @@ class Viewer(QOpenGLWidget):
             self.set_zoom(self.zoom * WHEEL_ZOOM_STEP ** steps, event.position())
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        near_wipe = self.is_comparing and self.compare_mode is CompareMode.WIPE and \
+            abs(event.position().x() - self._wipe_x()) <= WIPE_GRAB_PIXELS
+        if event.button() == Qt.LeftButton and near_wipe:
+            self._is_dragging_wipe = True
+            return
         if event.button() in (Qt.LeftButton, Qt.MiddleButton):
             self._drag_origin = (event.position(), QPointF(self.pan))
             self.setCursor(Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         self._mouse = event.position()
+        if self._is_dragging_wipe:
+            left, _, right, _ = self._image_rect()
+            self.wipe_position = min(1.0, max(0.0, (event.position().x() - left) / max(1.0, right - left)))
+            self.update()
+            return
         if self._drag_origin is not None:
             start, pan_at_start = self._drag_origin
             self.pan = pan_at_start + (event.position() - start)
@@ -441,6 +540,7 @@ class Viewer(QOpenGLWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         self._drag_origin = None
+        self._is_dragging_wipe = False
         self.unsetCursor()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:

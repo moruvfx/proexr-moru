@@ -38,7 +38,7 @@ from .media_list import MediaList
 from .ocio_panel import OcioPanel
 from .timeline import Timeline
 from .transport_bar import SPEEDS, TransportBar
-from .viewer import Channel, Viewer, ViewTransform
+from .viewer import Channel, CompareMode, Viewer, ViewTransform
 
 CACHE_SIZES_GB = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64)
 DEFAULT_CACHE_SHARE = 0.3
@@ -49,6 +49,8 @@ EMPTY_HINT = "Drop images, EXR sequences, videos or folders here\n\nCtrl+O open 
 FILE_FILTER = ("Media (*.exr *.sxr *.png *.jpg *.jpeg *.tif *.tiff *.tga *.dpx *.cin *.hdr *.bmp *.psd *.webp "
                "*.jp2 *.jxl *.mp4 *.mov *.avi *.mkv *.mxf *.webm *.m4v *.mpg *.ts);;All files (*)")
 CHANNEL_NAMES = ("RGB", "Red", "Green", "Blue", "Alpha", "Luminance")
+COMPARE_NAMES = ("Off", "B only", "Wipe", "Side by side", "Difference")
+COMPARE_CACHE_SHARE = 0.4
 VIEW_NAMES = ("Raw", "sRGB", "Rec.709", "ACES filmic (approx)", "OCIO")
 
 
@@ -83,9 +85,12 @@ class MainWindow(QMainWindow):
         default_gb = max(1, min(MAX_DEFAULT_CACHE_GB, int(total_memory_bytes() * DEFAULT_CACHE_SHARE) >> 30))
         self.cache_gb = self.settings.value("cache_gb", default_gb, type=int)
         self.cache = FrameCache(self.cache_gb << 30)
+        self.compare_cache = FrameCache(int((self.cache_gb << 30) * COMPARE_CACHE_SHARE))
+        self.compare_source: MediaSource | None = None
         self._relay = FrameReadyRelay()
         self._relay.ready.connect(self._frame_ready, Qt.QueuedConnection)
         self.cache.on_frame_ready = self._relay.ready.emit
+        self.compare_cache.on_frame_ready = self._relay.ready.emit
         self.source: MediaSource | None = None
         self.layer = 0
         self.clock = PlaybackClock(0, 0, 24.0, is_ready=self._is_cached)
@@ -147,9 +152,13 @@ class MainWindow(QMainWindow):
         self.gamma_field.setSingleStep(0.1)
         self.gamma_field.setValue(1.0)
         self.gamma_field.setAccessibleName("Gamma")
+        self.compare_box = QComboBox()
+        self.compare_box.addItems(COMPARE_NAMES)
+        self.compare_box.setAccessibleName("Compare mode")
+        self.compare_box.currentIndexChanged.connect(self._set_compare_mode)
         for caption, widget in (("Layer", self.layer_box), ("Channel", self.channel_box),
                                 ("View", self.view_box), ("Exposure", self.exposure_field),
-                                ("Gamma", self.gamma_field)):
+                                ("Gamma", self.gamma_field), ("Compare", self.compare_box)):
             label = QLabel(caption)
             label.setProperty("role", "muted")
             bar.addWidget(label)
@@ -176,6 +185,7 @@ class MainWindow(QMainWindow):
         self.media_list = MediaList()
         self.media_list.sourceSelected.connect(self.set_source)
         self.media_list.removeRequested.connect(self.close_source)
+        self.media_list.compareRequested.connect(self.set_compare_source)
         self.color_panel = ColorPanel()
         self.color_panel.gradeChanged.connect(self._apply_grade)
         self.info_panel = InfoPanel()
@@ -263,6 +273,8 @@ class MainWindow(QMainWindow):
         play_menu.addAction(self._action("faster", lambda: self._cycle(self.transport.speed_box, 1, wrap=False)))
         play_menu.addAction(self._action("slower", lambda: self._cycle(self.transport.speed_box, -1, wrap=False)))
         play_menu.addSeparator()
+        play_menu.addAction(self._action("cycle_compare_source", self._cycle_compare_source))
+        play_menu.addAction(self._action("toggle_compare", self._toggle_compare))
         play_menu.addAction(self._action("next_media", lambda: self._cycle_media(1)))
         play_menu.addAction(self._action("previous_media", lambda: self._cycle_media(-1)))
 
@@ -398,6 +410,8 @@ class MainWindow(QMainWindow):
         row = self.media_list.sources().index(source)
         self.media_list.remove_source(source)
         self.cache.forget(source)
+        if source is self.compare_source:
+            self.set_compare_source(None)
         source.close()
         if source is not self.source:
             return
@@ -411,13 +425,32 @@ class MainWindow(QMainWindow):
         self.info_panel.clear()
         self.layer_box.clear()
 
+    def _compare_number(self, number: int) -> int:
+        b = self.compare_source
+        return min(b.last, max(b.first, b.first + number - self.source.first))
+
+    def _is_comparing(self) -> bool:
+        return self.compare_source is not None and self.viewer.compare_mode is not CompareMode.OFF
+
     def _is_cached(self, number: int) -> bool:
-        return self.source is not None and self.cache.get(self.source, number, self.layer) is not None
+        if self.source is None or self.cache.get(self.source, number, self.layer) is None:
+            return False
+        if self._is_comparing():
+            return self.compare_cache.get(self.compare_source, self._compare_number(number), 0) is not None
+        return True
 
     def _follow(self) -> None:
-        if self.source is not None:
-            self.cache.follow(self.source, self.layer, self.clock.current, self.clock.direction or 1,
-                              (self.clock.in_point, self.clock.out_point))
+        if self.source is None:
+            return
+        direction = self.clock.direction or 1
+        self.cache.follow(self.source, self.layer, self.clock.current, direction,
+                          (self.clock.in_point, self.clock.out_point))
+        if self._is_comparing():
+            b = self.compare_source
+            self.compare_cache.follow(b, 0, self._compare_number(self.clock.current), direction,
+                                      (self._compare_number(self.clock.in_point), self._compare_number(self.clock.out_point)))
+        else:
+            self.compare_cache.follow(None, 0, 0, 1, (0, 0))
 
     def _show(self, number: int, wait: bool = False) -> None:
         if self.source is None:
@@ -429,6 +462,7 @@ class MainWindow(QMainWindow):
             frame = self.cache.read_now(self.source, number, self.layer)
         if frame is not None:
             self.viewer.show_frame(frame)
+            self._show_compare(number, wait)
         elif self.cache.error_for(self.source, number, self.layer):
             self.viewer.hint = f"Cannot read frame {number}:\n{self.cache.error_for(self.source, number, self.layer)}"
             self.viewer.update()
@@ -437,8 +471,21 @@ class MainWindow(QMainWindow):
         self.transport.frame_field.setValue(number)
         self.transport.frame_field.blockSignals(False)
 
+    def _show_compare(self, number: int, wait: bool) -> None:
+        if not self._is_comparing():
+            return
+        b_number = self._compare_number(number)
+        frame = self.compare_cache.get(self.compare_source, b_number, 0)
+        if frame is None and wait:
+            frame = self.compare_cache.read_now(self.compare_source, b_number, 0)
+        if frame is not None:
+            self.viewer.show_compare_frame(frame)
+
     def _frame_ready(self, key: CacheKey) -> None:
         if self.source is None or self.clock.is_playing:
+            return
+        if self._is_comparing() and key == (self.compare_source.uid, 0, self._compare_number(self.clock.current)):
+            self._show_compare(self.clock.current, wait=False)
             return
         if key == (self.source.uid, self.layer, self.clock.current) and \
                 (self.viewer.frame is None or self.viewer.frame.number != key[2] or
@@ -528,6 +575,37 @@ class MainWindow(QMainWindow):
             return
         self.layer = index
         self._show(self.clock.current, wait=not self.clock.is_playing)
+
+    def set_compare_source(self, source: MediaSource | None) -> None:
+        self.compare_source = source
+        self.media_list.mark_compare(source)
+        self.viewer.show_compare_frame(None)
+        if source is not None and self.viewer.compare_mode is CompareMode.OFF:
+            self.compare_box.setCurrentText("Wipe")
+        self._follow()
+        self._show_compare(self.clock.current, wait=True)
+
+    def _cycle_compare_source(self) -> None:
+        candidates = [s for s in self.media_list.sources() if s is not self.source]
+        if not candidates:
+            return
+        index = candidates.index(self.compare_source) + 1 if self.compare_source in candidates else 0
+        self.set_compare_source(candidates[index % len(candidates)])
+
+    def _set_compare_mode(self, index: int) -> None:
+        self.viewer.compare_mode = CompareMode(index)
+        if self.viewer.is_fit:
+            self.viewer.fit()
+        self._follow()
+        self._show_compare(self.clock.current, wait=not self.clock.is_playing)
+        self.viewer.update()
+
+    def _toggle_compare(self) -> None:
+        if self.compare_box.currentIndex():
+            self._last_compare_index = self.compare_box.currentIndex()
+            self.compare_box.setCurrentIndex(0)
+        else:
+            self.compare_box.setCurrentIndex(getattr(self, "_last_compare_index", CompareMode.WIPE))
 
     def _set_channel(self, index: int) -> None:
         self.viewer.channel = Channel(index)
@@ -635,6 +713,7 @@ class MainWindow(QMainWindow):
         self.cache_gb = size_gb
         self.settings.setValue("cache_gb", size_gb)
         self.cache.set_budget(size_gb << 30)
+        self.compare_cache.set_budget(int((size_gb << 30) * COMPARE_CACHE_SHARE))
 
     def _set_hardware_decode(self, enabled: bool) -> None:
         self.hardware_decode = enabled
@@ -664,6 +743,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("window_state", self.saveState())
         self.stop()
         self.cache.shutdown()
+        self.compare_cache.shutdown()
         for source in self.media_list.sources():
             source.close()
         super().closeEvent(event)

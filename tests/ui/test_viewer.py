@@ -3,7 +3,7 @@ import pytest
 from ui_helpers import settle
 
 from proexr.media.frame import Frame
-from proexr.ui.viewer import Channel, Viewer, ViewTransform
+from proexr.ui.viewer import Channel, CompareMode, Viewer, ViewTransform
 
 
 @pytest.fixture
@@ -103,3 +103,45 @@ def test_ocio_view_keeps_display_referred_source_unchanged(viewer, qapp):
     viewer.view_transform = ViewTransform.OCIO
     viewer.show_frame(solid([200, 100, 30], np.uint8, "srgb", 3))
     assert center(viewer, qapp) == pytest.approx((200, 100, 30), abs=3)
+
+
+def pixel_at(viewer, qapp, fx: float, fy: float = 0.5) -> tuple[int, int, int]:
+    settle(qapp)
+    image = viewer.grabFramebuffer()
+    color = image.pixelColor(int(image.width() * fx), int(image.height() * fy))
+    return color.red(), color.green(), color.blue()
+
+
+def show_pair(viewer):
+    viewer.view_transform = ViewTransform.RAW
+    viewer.show_frame(solid([1.0, 0.0, 0.0, 1.0]))
+    viewer.show_compare_frame(solid([0.0, 0.0, 1.0, 1.0]))
+
+
+def test_wipe_shows_a_left_and_b_right(viewer, qapp):
+    show_pair(viewer)
+    viewer.compare_mode = CompareMode.WIPE
+    viewer.wipe_position = 0.5
+    assert pixel_at(viewer, qapp, 0.4) == pytest.approx((255, 0, 0), abs=2)
+    assert pixel_at(viewer, qapp, 0.6) == pytest.approx((0, 0, 255), abs=2)
+
+
+def test_b_only_and_difference(viewer, qapp):
+    show_pair(viewer)
+    viewer.compare_mode = CompareMode.B_ONLY
+    assert center(viewer, qapp) == pytest.approx((0, 0, 255), abs=2)
+    viewer.compare_mode = CompareMode.DIFFERENCE
+    assert center(viewer, qapp) == pytest.approx((255, 0, 255), abs=2)
+
+
+def test_side_by_side_splits_the_view(viewer, qapp):
+    show_pair(viewer)
+    viewer.compare_mode = CompareMode.SIDE_BY_SIDE
+    assert pixel_at(viewer, qapp, 0.25) == pytest.approx((255, 0, 0), abs=2)
+    assert pixel_at(viewer, qapp, 0.75) == pytest.approx((0, 0, 255), abs=2)
+
+
+def test_compare_off_ignores_b(viewer, qapp):
+    show_pair(viewer)
+    viewer.compare_mode = CompareMode.OFF
+    assert pixel_at(viewer, qapp, 0.6) == pytest.approx((255, 0, 0), abs=2)

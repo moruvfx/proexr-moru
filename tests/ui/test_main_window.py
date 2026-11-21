@@ -117,3 +117,22 @@ def test_ocio_view_bakes_lut_for_media_input(window, qapp, exr_sequence):
     assert window.viewer.view_transform.name == "OCIO"
     assert window.viewer.display_lut is not None
     assert window.viewer.display_lut.shaper == "log"
+
+
+def test_compare_wipe_shows_b_frame_aligned_to_a(window, qapp, exr_sequence, video_file):
+    window.open_paths([str(exr_sequence), str(video_file)])
+    a, b = window.media_list.sources()
+    window.media_list.select_source(a)
+    window.set_compare_source(b)
+    window.compare_box.setCurrentText("Wipe")
+    window.seek(1004)
+    assert wait_for(qapp, lambda: window.viewer.compare_frame is not None and window.viewer.compare_frame.number == 3)
+    assert window.viewer.compare_mode.name == "WIPE"
+    assert "B" in window.media_list.item(1).text().split("\n")[0]
+
+
+def test_compare_shortcut_cycles_b_source(window, qapp, exr_sequence, video_file):
+    window.open_paths([str(exr_sequence), str(video_file)])
+    window.viewer.setFocus()
+    QTest.keyClick(window.viewer, Qt.Key_B, Qt.ControlModifier)
+    assert window.compare_source is window.media_list.sources()[1]

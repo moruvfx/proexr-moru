@@ -25,6 +25,8 @@ DEFAULT_SHORTCUTS: dict[str, tuple[str, str]] = {
     "cycle_loop": ("Ctrl+L", "Cycle loop mode"),
     "faster": ("]", "Faster"),
     "slower": ("[", "Slower"),
+    "cycle_compare_source": ("Ctrl+B", "Compare: set next media as B"),
+    "toggle_compare": ("\\", "Compare on / off"),
     "next_media": ("PgDown", "Next media"),
     "previous_media": ("PgUp", "Previous media"),
     "fit": ("F", "Fit to window"),
