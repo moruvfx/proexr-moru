@@ -76,6 +76,14 @@ class FrameCache:
             self._make_room(0, needed_in=-1)
             self._condition.notify_all()
 
+    def clear(self) -> None:
+        """Drop every cached frame and remembered error; prefetching refills from the playhead."""
+        with self._condition:
+            self._frames.clear()
+            self._errors.clear()
+            self._used_bytes = 0
+            self._condition.notify_all()
+
     def forget(self, source: MediaSource) -> None:
         with self._condition:
             for key in [k for k in self._frames if k[0] == source.uid]:

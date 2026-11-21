@@ -11,13 +11,13 @@ METADATA_KEYS = ("compression", "oiio:ColorSpace", "Software", "DateTime", "dpx:
                  "oiio:BitsPerSample", "PixelAspectRatio")
 
 
-def _read_type(spec: oiio.ImageSpec, colorspace: Colorspace) -> str:
+def _read_type(spec: oiio.ImageSpec, colorspace: Colorspace, channel_count: int) -> str:
     name = str(spec.format)
     if name == "uint8":
         return "half" if colorspace == "linear" else "uint8"
     if name == "uint16":
         return "uint16"
-    if name == "half":
+    if name == "half" or channel_count >= 3:
         return "half"
     return "float"
 
@@ -114,7 +114,8 @@ class ImageSequenceSource(MediaSource):
         try:
             image.seek_subimage(selected.part, 0)
             spec = oiio.ImageSpec(image.spec())
-            pixels = image.read_image(selected.part, 0, begin, end, _read_type(spec, self.colorspace))
+            read_type = _read_type(spec, self.colorspace, len(selected.channel_indices))
+            pixels = image.read_image(selected.part, 0, begin, end, read_type)
             if pixels is None:
                 raise MediaReadError(f"Cannot read {path}: {image.geterror()}")
         finally:

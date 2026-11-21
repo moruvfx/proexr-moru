@@ -120,3 +120,16 @@ def test_ready_callback_fires_for_loaded_frames():
     assert wait_until(lambda: len(seen) >= 3)
     assert (source.uid, 0, 0) in seen
     cache.shutdown()
+
+
+def test_clear_drops_frames_then_refills_from_playhead():
+    cache = FrameCache(20 * FRAME_BYTES, workers=2)
+    source = FakeSource()
+    cache.follow(source, 0, 0, 1, (0, 99))
+    assert wait_until(lambda: len(cache.cached_numbers(source, 0)) == 20)
+    cache.follow(None, 0, 0, 1, (0, 99))
+    cache.clear()
+    assert cache.used_bytes == 0 and not cache.cached_numbers(source, 0)
+    cache.follow(source, 0, 50, 1, (0, 99))
+    assert wait_until(lambda: 50 in cache.cached_numbers(source, 0))
+    cache.shutdown()

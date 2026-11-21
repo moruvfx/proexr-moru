@@ -1,5 +1,3 @@
-import os
-import sys
 import time
 from pathlib import Path
 
@@ -32,6 +30,7 @@ from ..media.frame import MediaSource
 from ..media.opener import open_media
 from ..playback.clock import PlaybackClock
 from ..playback.frame_cache import CacheKey, FrameCache
+from ..playback.memory import available_memory_bytes, safe_cache_budget, total_memory_bytes
 from . import palette, shortcuts
 from .color_panel import ColorPanel
 from .info_panel import InfoPanel
@@ -47,6 +46,7 @@ CACHE_SIZES_GB = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64)
 DEFAULT_CACHE_SHARE = 0.3
 MAX_DEFAULT_CACHE_GB = 16
 STATUS_INTERVAL_MS = 250
+MEMORY_CHECK_INTERVAL_MS = 2000
 SCOPE_INTERVAL_MS = 120
 SCOPE_SAMPLE_WIDTH = 384
 EXPOSURE_NUDGE = 0.5
@@ -57,23 +57,6 @@ CHANNEL_NAMES = ("RGB", "Red", "Green", "Blue", "Alpha", "Luminance")
 COMPARE_NAMES = ("Off", "B only", "Wipe", "Side by side", "Difference")
 COMPARE_CACHE_SHARE = 0.4
 VIEW_NAMES = ("Raw", "sRGB", "Rec.709", "ACES filmic (approx)", "OCIO")
-
-
-def total_memory_bytes() -> int:
-    if sys.platform == "win32":
-        import ctypes
-
-        class MemoryStatus(ctypes.Structure):
-            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
-                        ("total_physical", ctypes.c_ulonglong), ("available_physical", ctypes.c_ulonglong),
-                        ("total_page", ctypes.c_ulonglong), ("available_page", ctypes.c_ulonglong),
-                        ("total_virtual", ctypes.c_ulonglong), ("available_virtual", ctypes.c_ulonglong),
-                        ("available_extended", ctypes.c_ulonglong)]
-        status = MemoryStatus()
-        status.length = ctypes.sizeof(MemoryStatus)
-        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-        return int(status.total_physical)
-    return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
 
 
 class FrameReadyRelay(QObject):
@@ -126,6 +109,9 @@ class MainWindow(QMainWindow):
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._refresh_status)
         self._status_timer.start(STATUS_INTERVAL_MS)
+        self._memory_timer = QTimer(self)
+        self._memory_timer.timeout.connect(self._adapt_cache_to_memory)
+        self._memory_timer.start(MEMORY_CHECK_INTERVAL_MS)
         if self.settings.value("geometry") is not None:
             self.restoreGeometry(self.settings.value("geometry"))
         if self.settings.value("window_state") is not None:
@@ -228,11 +214,13 @@ class MainWindow(QMainWindow):
         self.pixel_label.setStyleSheet(f"font-family: {palette.MONO_FAMILY};")
         self.fps_label = QLabel()
         self.cache_label = QLabel()
+        self.decoder_label = QLabel()
         self.zoom_label = QLabel("100%")
         self.gpu_label = QLabel()
         status = self.statusBar()
         status.addWidget(self.pixel_label, 1)
         status.addPermanentWidget(self.fps_label)
+        status.addPermanentWidget(self.decoder_label)
         status.addPermanentWidget(self.cache_label)
         status.addPermanentWidget(self.zoom_label)
         status.addPermanentWidget(self.gpu_label)
@@ -355,6 +343,10 @@ class MainWindow(QMainWindow):
                            checked=self.hardware_decode)
         hardware.toggled.connect(self._set_hardware_decode)
         settings_menu.addAction(hardware)
+        settings_menu.addSeparator()
+        clear = QAction("Clear frame cache", self)
+        clear.triggered.connect(self.clear_cache)
+        settings_menu.addAction(clear)
 
         help_menu = bar.addMenu("&Help")
         keys = QAction("Keyboard shortcuts", self)
@@ -706,7 +698,14 @@ class MainWindow(QMainWindow):
     def _refresh_status(self) -> None:
         if self.source is not None:
             self.timeline.set_cached(self.cache.cached_numbers(self.source, self.layer))
-        self.cache_label.setText(f"Cache {self.cache.used_bytes / (1 << 30):.1f} / {self.cache_gb} GB")
+        budget = self.cache.max_bytes / (1 << 30)
+        used = self.cache.used_bytes / (1 << 30)
+        percent = 100 * self.cache.used_bytes / self.cache.max_bytes if self.cache.max_bytes else 0
+        self.cache_label.setText(f"Cache {used:.1f} / {budget:.1f} GB ({percent:.0f}%)")
+        self.cache_label.setToolTip(f"Configured {self.cache_gb} GB; shrinks automatically when free RAM runs low")
+        device = getattr(self.source, "hardware_device", None)
+        is_video = self.source is not None and self.source.kind == "video"
+        self.decoder_label.setText(("GPU decode: " + device if device else "CPU decode") if is_video else "")
         if self.clock.is_playing and len(self._shown_at) > 1:
             span = self._shown_at[-1] - self._shown_at[0]
             measured = (len(self._shown_at) - 1) / span if span > 0 else 0.0
@@ -746,8 +745,25 @@ class MainWindow(QMainWindow):
     def _set_cache_size(self, size_gb: int) -> None:
         self.cache_gb = size_gb
         self.settings.setValue("cache_gb", size_gb)
-        self.cache.set_budget(size_gb << 30)
-        self.compare_cache.set_budget(int((size_gb << 30) * COMPARE_CACHE_SHARE))
+        self._adapt_cache_to_memory()
+
+    def _adapt_cache_to_memory(self) -> None:
+        """Keep both caches inside the configured size and the RAM the system can spare right now."""
+        available = available_memory_bytes()
+        used = self.cache.used_bytes + self.compare_cache.used_bytes
+        total = safe_cache_budget(self.cache_gb << 30, used, available)
+        main_share = total if self.compare_source is None else int(total * (1 - COMPARE_CACHE_SHARE))
+        if main_share != self.cache.max_bytes:
+            self.cache.set_budget(main_share)
+        compare_share = total - main_share if self.compare_source is not None else int(total * COMPARE_CACHE_SHARE)
+        if compare_share != self.compare_cache.max_bytes:
+            self.compare_cache.set_budget(compare_share)
+
+    def clear_cache(self) -> None:
+        self.cache.clear()
+        self.compare_cache.clear()
+        self.timeline.set_cached(set())
+        self._refresh_status()
 
     def _set_hardware_decode(self, enabled: bool) -> None:
         self.hardware_decode = enabled

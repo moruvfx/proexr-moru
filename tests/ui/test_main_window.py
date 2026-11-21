@@ -154,3 +154,20 @@ def test_pixel_inspector_reports_hovered_pixel(window, qapp, exr_sequence):
     QTest.mouseMove(viewer, QPoint(viewer.width() // 2, viewer.height() // 2))
     assert wait_for(qapp, lambda: "Luminance" in window.pixel_inspector.details.text())
     assert "R " in window.pixel_inspector.details.text()
+
+
+def test_cache_shrinks_when_free_memory_runs_low(window, monkeypatch):
+    import proexr.ui.main_window as main_window
+
+    monkeypatch.setattr(main_window, "available_memory_bytes", lambda: 2 << 30)
+    window._set_cache_size(8)
+    assert window.cache.max_bytes + window.compare_cache.max_bytes < 2 << 30
+
+
+def test_clear_cache_action_empties_both_caches(window, qapp, exr_sequence):
+    window.open_paths([str(exr_sequence)])
+    assert wait_for(qapp, lambda: window.cache.used_bytes > 0)
+    window.stop()
+    window.clear_cache()
+    assert window.compare_cache.used_bytes == 0
+    assert "Cache" in window.cache_label.text()
