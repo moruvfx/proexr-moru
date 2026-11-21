@@ -12,3 +12,7 @@ class MediaReadError(ProexrError):
 
 class ColorConfigError(ProexrError):
     pass
+
+
+class PlaylistError(ProexrError):
+    """A playlist file could not be read or written."""

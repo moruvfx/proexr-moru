@@ -18,6 +18,7 @@ MISSING = QColor("#EF4444")
 SAFE_ACTION = QColor(255, 210, 80, 170)
 SAFE_TITLE = QColor(120, 200, 255, 170)
 GUIDE = QColor(255, 255, 255, 70)
+GUIDE_MASK = QColor(0, 0, 0, 160)
 CLIP_OVER = QColor("#FF00FF")
 CLIP_UNDER = QColor("#0099FF")
 FONT_FAMILY = "Inter, Segoe UI, Arial, sans-serif"

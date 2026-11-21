@@ -7,6 +7,7 @@ from PySide6.QtTest import QTest
 from ui_helpers import settle
 
 from proexr.ui import shortcuts
+from proexr.ui.icons import make_icon
 from proexr.ui.main_window import MainWindow
 
 
@@ -171,3 +172,71 @@ def test_clear_cache_action_empties_both_caches(window, qapp, exr_sequence):
     window.clear_cache()
     assert window.compare_cache.used_bytes == 0
     assert "Cache" in window.cache_label.text()
+
+
+def test_playlist_round_trip_reopens_media(window, qapp, exr_sequence, video_file, tmp_path):
+    window.open_paths([str(exr_sequence), str(video_file)])
+    playlist = tmp_path / "review.proexr.json"
+    window.save_playlist(playlist)
+    for source in list(window.media_list.sources()):
+        window.close_source(source)
+    assert window.media_list.count() == 0
+    window.open_playlist(playlist)
+    assert [s.kind for s in window.media_list.sources()] == ["sequence", "video"]
+
+
+def test_file_browser_lists_folder_media_with_thumbnails(window, qapp, exr_sequence):
+    browser = window.file_browser
+    browser.show_folder(str(exr_sequence))
+    assert wait_for(qapp, lambda: browser.grid.count() == 1)
+    item = browser.grid.item(0)
+    placeholder = make_icon("image").cacheKey()
+    assert wait_for(qapp, lambda: item.icon().cacheKey() != placeholder)
+    item.setSelected(True)
+    browser.open_selected()
+    assert window.media_list.count() == 1
+
+
+def test_aspect_guide_masks_outside_the_frame(window, qapp, exr_sequence):
+    window.open_paths([str(exr_sequence)])
+    assert wait_for(qapp, lambda: window.viewer.frame is not None)
+    window.set_aspect_guide(2.39)
+    settle(qapp)
+    image = window.viewer.grabFramebuffer()
+    left, top, right, bottom = window.viewer._image_rect()
+    inside = image.pixelColor(int((left + right) / 2), int((top + bottom) / 2))
+    masked = image.pixelColor(int((left + right) / 2), int(top) + 2)
+    assert masked.lightness() < inside.lightness() or inside.lightness() == 0
+
+
+def test_audio_follows_forward_playback_only(window, qapp, audio_file, monkeypatch):
+    calls = []
+    monkeypatch.setattr(window.audio_player, "play", lambda track, seconds: calls.append(seconds) or True)
+    import av
+    import numpy as np
+    clip = audio_file.with_name("av.mp4")
+    container = av.open(str(clip), "w")
+    video = container.add_stream("libx264", rate=25)
+    video.width, video.height, video.pix_fmt = 64, 48, "yuv420p"
+    audio = container.add_stream("aac", rate=48000, layout="stereo")
+    for _ in range(25):
+        for packet in video.encode(av.VideoFrame.from_ndarray(np.zeros((48, 64, 3), np.uint8), format="rgb24")):
+            container.mux(packet)
+    for start in range(0, 48000, 1024):
+        frame = av.AudioFrame.from_ndarray(np.zeros((2, 1024), np.float32), format="fltp", layout="stereo")
+        frame.sample_rate, frame.pts = 48000, start
+        for packet in audio.encode(frame):
+            container.mux(packet)
+    for stream in (video, audio):
+        for packet in stream.encode():
+            container.mux(packet)
+    container.close()
+    window.open_paths([str(clip)])
+    assert wait_for(qapp, lambda: window.viewer.frame is not None)
+    window.seek(10)
+    window.play(1)
+    assert len(calls) == 1 and abs(calls[0] - 10 / 25) < 0.05
+    window.stop()
+    window.play(-1)
+    assert len(calls) == 1
+    window.stop()

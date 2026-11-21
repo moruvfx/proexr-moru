@@ -4,7 +4,7 @@ from enum import IntEnum
 
 import numpy as np
 from OpenGL import GL
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
@@ -208,6 +208,7 @@ class Viewer(QOpenGLWidget):
         self.show_clipping = False
         self.nearest_when_magnified = True
         self.overlays = {"safe_areas": False, "thirds": False, "center": False}
+        self.aspect_guide = 0.0
         self.pixel_aspect = 1.0
         self.hint = ""
         self.zoom = 1.0
@@ -454,6 +455,8 @@ class Viewer(QOpenGLWidget):
         if self.frame is not None:
             left, top, right, bottom = self._image_rect()
             width, height = right - left, bottom - top
+            if self.aspect_guide > 0:
+                self._paint_aspect_guide(painter, left, top, right, bottom)
             if self.overlays["safe_areas"]:
                 for fraction, color in ((0.9, palette.SAFE_ACTION), (0.8, palette.SAFE_TITLE)):
                     painter.setPen(QPen(color, 1, Qt.DashLine))
@@ -480,6 +483,26 @@ class Viewer(QOpenGLWidget):
             painter.setPen(palette.TEXT_MUTED)
             painter.drawText(self.rect(), Qt.AlignCenter, self.hint)
         painter.end()
+
+    def _paint_aspect_guide(self, painter: QPainter, left: float, top: float, right: float, bottom: float) -> None:
+        """Dims the image outside a centred frame of the chosen aspect ratio and outlines that frame."""
+        width, height = right - left, bottom - top
+        image_aspect = width / height if height else 1.0
+        if self.aspect_guide >= image_aspect:
+            inner_height = width / self.aspect_guide
+            inner = QRectF(left, top + (height - inner_height) / 2, width, inner_height)
+        else:
+            inner_width = height * self.aspect_guide
+            inner = QRectF(left + (width - inner_width) / 2, top, inner_width, height)
+        outer = QRectF(left, top, width, height)
+        painter.fillRect(QRectF(outer.left(), outer.top(), outer.width(), inner.top() - outer.top()), palette.GUIDE_MASK)
+        painter.fillRect(QRectF(outer.left(), inner.bottom(), outer.width(), outer.bottom() - inner.bottom()),
+                         palette.GUIDE_MASK)
+        painter.fillRect(QRectF(outer.left(), inner.top(), inner.left() - outer.left(), inner.height()), palette.GUIDE_MASK)
+        painter.fillRect(QRectF(inner.right(), inner.top(), outer.right() - inner.right(), inner.height()),
+                         palette.GUIDE_MASK)
+        painter.setPen(QPen(palette.GUIDE, 1))
+        painter.drawRect(inner)
 
     def _wipe_x(self) -> float:
         left, _, right, _ = self._image_rect()

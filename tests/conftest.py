@@ -53,3 +53,25 @@ def video_file(tmp_path: Path) -> Path:
         container.mux(packet)
     container.close()
     return path
+
+
+@pytest.fixture
+def audio_file(tmp_path: Path) -> Path:
+    """Two seconds of a 440 Hz tone in the left channel and silence in the right, 44.1 kHz AAC."""
+    path = tmp_path / "tone.m4a"
+    container = av.open(str(path), "w")
+    stream = container.add_stream("aac", rate=44100, layout="stereo")
+    samples = np.arange(44100 * 2)
+    tone = (np.sin(2 * np.pi * 440 * samples / 44100) * 0.5).astype(np.float32)
+    planar = np.stack([tone, np.zeros_like(tone)])
+    for start in range(0, planar.shape[1], 1024):
+        chunk = np.ascontiguousarray(planar[:, start:start + 1024])
+        frame = av.AudioFrame.from_ndarray(chunk, format="fltp", layout="stereo")
+        frame.sample_rate = 44100
+        frame.pts = start
+        for packet in stream.encode(frame):
+            container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+    return path

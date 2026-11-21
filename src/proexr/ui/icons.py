@@ -67,6 +67,13 @@ def _glyph(name: str) -> QPainterPath:
         path.lineTo(17, 15)
         path.lineTo(3, 15)
         path.closeSubpath()
+    elif name == "image":
+        path.addRect(QRectF(3.5, 5, 13, 10))
+        path.moveTo(3.5, 13)
+        path.lineTo(8, 9)
+        path.lineTo(11, 12)
+        path.lineTo(13, 10.5)
+        path.lineTo(16.5, 13.5)
     return path
 
 

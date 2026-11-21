@@ -23,6 +23,7 @@ class VideoSource(MediaSource):
         self._decoded: Iterator[av.VideoFrame] | None = None
         self._next_number: int | None = None
         self._last_pixels: np.ndarray | None = None
+        self._closed = False
         self._open()
         stream = self._stream
         rate = stream.average_rate or stream.guessed_rate or stream.base_rate
@@ -31,7 +32,7 @@ class VideoSource(MediaSource):
         self.width, self.height = codec.width, codec.height
         aspect = stream.sample_aspect_ratio or codec.sample_aspect_ratio
         self.pixel_aspect = float(aspect) if aspect and float(aspect) > 0 else 1.0
-        self._start_seconds = float(stream.start_time * stream.time_base) if stream.start_time else 0.0
+        self.start_seconds = float(stream.start_time * stream.time_base) if stream.start_time else 0.0
         self.first, self.last = 0, self._count_frames() - 1
         self.colorspace = "srgb"
         pixel_format = codec.format.name if codec.format else "unknown"
@@ -88,14 +89,14 @@ class VideoSource(MediaSource):
         return max(1, round(seconds * self.fps))
 
     def _frame_number(self, frame: av.VideoFrame) -> int:
-        return round((float(frame.time) - self._start_seconds) * self.fps)
+        return round((float(frame.time) - self.start_seconds) * self.fps)
 
     def _decode(self) -> Iterator[av.VideoFrame]:
         for packet in self._container.demux(self._stream):
             yield from packet.decode()
 
     def _seek(self, number: int) -> None:
-        timestamp = int((number / self.fps + self._start_seconds) / self._stream.time_base)
+        timestamp = int((number / self.fps + self.start_seconds) / self._stream.time_base)
         self._container.seek(max(timestamp, 0), stream=self._stream, backward=True, any_frame=False)
         self._decoded = self._decode()
         self._next_number = None
@@ -125,6 +126,8 @@ class VideoSource(MediaSource):
     def read(self, number: int, layer: int = 0) -> Frame:
         number = min(max(number, self.first), self.last)
         with self._lock:
+            if self._closed:
+                raise MediaReadError(f"{self.path.name} is closed")
             try:
                 return self._read_locked(number)
             except av.FFmpegError as error:
@@ -138,4 +141,6 @@ class VideoSource(MediaSource):
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
+            self._decoded = None
             self._container.close()

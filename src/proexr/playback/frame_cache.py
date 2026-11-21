@@ -159,8 +159,11 @@ class FrameCache:
                     continue
                 self._pending.update(batch)
                 source = self._source
-            for key in batch:
-                self._pool.submit(self._load, source, key)
+            try:
+                for key in batch:
+                    self._pool.submit(self._load, source, key)
+            except RuntimeError:
+                return  # pool shut down between the stop check and the submit
 
     def _read(self, source: MediaSource, key: CacheKey) -> Frame | None:
         try:

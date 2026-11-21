@@ -38,3 +38,16 @@ def test_out_of_range_frames_clamp(video_file):
 def test_hardware_decode_falls_back_to_software(video_file):
     source = VideoSource(video_file, hardware_decode=True)
     assert abs(red_level(source.read(12)) - 60) <= 3
+
+
+def test_reading_after_close_raises_instead_of_crashing(video_file):
+    import pytest
+
+    from proexr.errors import MediaReadError
+    from proexr.media.video_source import VideoSource
+
+    source = VideoSource(video_file, hardware_decode=False)
+    source.read(3)
+    source.close()
+    with pytest.raises(MediaReadError):
+        source.read(4)

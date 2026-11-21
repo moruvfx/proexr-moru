@@ -25,14 +25,18 @@ from PySide6.QtWidgets import (
 
 from .. import __version__
 from ..analysis.scopes import pixel_report
-from ..errors import ProexrError
+from ..errors import MediaReadError, PlaylistError, ProexrError
+from ..media.audio import AudioTrack, has_audio
 from ..media.frame import MediaSource
 from ..media.opener import open_media
+from ..media.playlist import PLAYLIST_SUFFIX, load_playlist, save_playlist
+from ..playback.audio_player import AudioPlayer
 from ..playback.clock import PlaybackClock
 from ..playback.frame_cache import CacheKey, FrameCache
 from ..playback.memory import available_memory_bytes, safe_cache_budget, total_memory_bytes
 from . import palette, shortcuts
 from .color_panel import ColorPanel
+from .file_browser import FileBrowser
 from .info_panel import InfoPanel
 from .media_list import MediaList
 from .ocio_panel import OcioPanel
@@ -47,6 +51,7 @@ DEFAULT_CACHE_SHARE = 0.3
 MAX_DEFAULT_CACHE_GB = 16
 STATUS_INTERVAL_MS = 250
 MEMORY_CHECK_INTERVAL_MS = 2000
+LAYOUT_VERSION = 2  # bump whenever docks are added or removed so stale saved layouts are ignored
 SCOPE_INTERVAL_MS = 120
 SCOPE_SAMPLE_WIDTH = 384
 EXPOSURE_NUDGE = 0.5
@@ -56,6 +61,8 @@ FILE_FILTER = ("Media (*.exr *.sxr *.png *.jpg *.jpeg *.tif *.tiff *.tga *.dpx *
 CHANNEL_NAMES = ("RGB", "Red", "Green", "Blue", "Alpha", "Luminance")
 COMPARE_NAMES = ("Off", "B only", "Wipe", "Side by side", "Difference")
 COMPARE_CACHE_SHARE = 0.4
+ASPECT_GUIDES = (("Off", 0.0), ("2.39:1 scope", 2.39), ("1.85:1 flat", 1.85), ("16:9", 16 / 9),
+                 ("4:3", 4 / 3), ("1:1", 1.0))
 VIEW_NAMES = ("Raw", "sRGB", "Rec.709", "ACES filmic (approx)", "OCIO")
 
 
@@ -81,6 +88,10 @@ class MainWindow(QMainWindow):
         self.compare_cache.on_frame_ready = self._relay.ready.emit
         self.source: MediaSource | None = None
         self.layer = 0
+        self.audio_player = AudioPlayer()
+        self.audio_enabled = not self.settings.value("muted", False, type=bool)
+        self._audio_tracks: dict[int, AudioTrack | None] = {}
+        self._last_shown: int | None = None
         self.clock = PlaybackClock(0, 0, 24.0, is_ready=self._is_cached)
         self._shown_at: list[float] = []
         self._docks_before_hide: list[QDockWidget] = []
@@ -115,7 +126,7 @@ class MainWindow(QMainWindow):
         if self.settings.value("geometry") is not None:
             self.restoreGeometry(self.settings.value("geometry"))
         if self.settings.value("window_state") is not None:
-            self.restoreState(self.settings.value("window_state"))
+            self.restoreState(self.settings.value("window_state"), LAYOUT_VERSION)
 
     def _build_view_bar(self) -> None:
         bar = self.view_bar = self.addToolBar("View")
@@ -187,7 +198,12 @@ class MainWindow(QMainWindow):
         self.scopes_panel = ScopesPanel()
         self.viewer.displaySampled.connect(self.scopes_panel.show_sample)
         self.pixel_inspector = PixelInspector()
+        self.file_browser = FileBrowser(self.settings.value("last_folder", ""))
+        self.file_browser.openRequested.connect(self.open_paths)
         self.media_dock = self._add_dock("Media", self.media_list, Qt.LeftDockWidgetArea, "media_dock")
+        self.browser_dock = self._add_dock("Browser", self.file_browser, Qt.LeftDockWidgetArea, "browser_dock")
+        self.tabifyDockWidget(self.media_dock, self.browser_dock)
+        self.media_dock.raise_()
         self.color_dock = self._add_dock("Color", self.color_panel, Qt.RightDockWidgetArea, "color_dock")
         self.ocio_dock = self._add_dock("Color management", self.ocio_panel, Qt.RightDockWidgetArea, "ocio_dock")
         self.info_dock = self._add_dock("Info", self.info_panel, Qt.RightDockWidgetArea, "info_dock")
@@ -256,6 +272,9 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self._action("open_folder", self.open_folder_dialog))
         file_menu.addAction(self._action("close_media", lambda: self.source and self.close_source(self.source)))
         file_menu.addSeparator()
+        file_menu.addAction(self._action("open_playlist", self.open_playlist_dialog))
+        file_menu.addAction(self._action("save_playlist", self.save_playlist_dialog))
+        file_menu.addSeparator()
         file_menu.addAction(self._action("quit", self.close))
 
         play_menu = bar.addMenu("&Playback")
@@ -281,6 +300,9 @@ class MainWindow(QMainWindow):
         play_menu.addAction(self._action("cycle_compare_source", self._cycle_compare_source))
         play_menu.addAction(self._action("toggle_compare", self._toggle_compare))
         play_menu.addAction(self._action("next_media", lambda: self._cycle_media(1)))
+        mute = self._action("mute", lambda on: self._set_audio_enabled(not on), True)
+        mute.setChecked(not self.audio_enabled)
+        play_menu.addAction(mute)
         play_menu.addAction(self._action("previous_media", lambda: self._cycle_media(-1)))
 
         view_menu = bar.addMenu("&View")
@@ -294,6 +316,13 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction(self._action("safe_areas", lambda on: self._set_overlay("safe_areas", on), True))
         view_menu.addAction(self._action("thirds", lambda on: self._set_overlay("thirds", on), True))
+        aspect_menu = view_menu.addMenu("Aspect guide")
+        aspect_group = QActionGroup(self)
+        for name, ratio in ASPECT_GUIDES:
+            option = QAction(name, self, checkable=True, checked=ratio == 0.0)
+            option.triggered.connect(lambda _=False, ratio=ratio: self.set_aspect_guide(ratio))
+            aspect_group.addAction(option)
+            aspect_menu.addAction(option)
         center = QAction("Center cross", self, checkable=True)
         center.toggled.connect(lambda on: self._set_overlay("center", on))
         view_menu.addAction(center)
@@ -306,6 +335,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction(timecode)
         panels = view_menu.addMenu("Panels")
         panels.addAction(self.media_dock.toggleViewAction())
+        panels.addAction(self.browser_dock.toggleViewAction())
         panels.addAction(self.color_dock.toggleViewAction())
         panels.addAction(self.ocio_dock.toggleViewAction())
         panels.addAction(self.scopes_dock.toggleViewAction())
@@ -421,6 +451,10 @@ class MainWindow(QMainWindow):
         row = self.media_list.sources().index(source)
         self.media_list.remove_source(source)
         self.cache.forget(source)
+        track = self._audio_tracks.pop(source.uid, None)
+        if track is not None:
+            self.audio_player.stop()
+            track.close()
         if source is self.compare_source:
             self.set_compare_source(None)
         source.close()
@@ -467,6 +501,7 @@ class MainWindow(QMainWindow):
         if self.source is None:
             return
         self.clock.current = number
+        self._last_shown = number
         self._follow()
         frame = self.cache.get(self.source, number, self.layer)
         if frame is None and wait:
@@ -509,6 +544,7 @@ class MainWindow(QMainWindow):
         self.clock.seek(number)
         self.clock.restart_timing(time.perf_counter())
         self._show(self.clock.current)
+        self._sync_audio()
 
     def step(self, frames: int) -> None:
         self.stop()
@@ -530,12 +566,14 @@ class MainWindow(QMainWindow):
         self._follow()
         self._play_timer.start(max(1, int(1000 / self.clock.rate / 4)))
         self.transport.show_direction(direction)
+        self._sync_audio()
 
     def stop(self) -> None:
         self.clock.stop()
         self._play_timer.stop()
         self.transport.show_direction(0)
         self._follow()
+        self.audio_player.stop()
 
     def toggle_play(self) -> None:
         if self.clock.is_playing:
@@ -548,7 +586,10 @@ class MainWindow(QMainWindow):
         if number is not None:
             self._shown_at.append(time.perf_counter())
             del self._shown_at[:-60]
+            jumped = self._last_shown is not None and number < self._last_shown
             self._show(number)
+            if jumped:
+                self._sync_audio()
         elif not self.clock.is_playing:
             self.stop()
 
@@ -575,6 +616,7 @@ class MainWindow(QMainWindow):
     def _set_speed(self, index: int) -> None:
         self.clock.speed = SPEEDS[index]
         self._retime()
+        self._sync_audio()
 
     def _retime(self) -> None:
         self.clock.restart_timing(time.perf_counter())
@@ -722,7 +764,7 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
 
     def toggle_panels(self) -> None:
-        docks = (self.media_dock, self.color_dock, self.ocio_dock, self.info_dock, self.scopes_dock,
+        docks = (self.media_dock, self.browser_dock, self.color_dock, self.ocio_dock, self.info_dock, self.scopes_dock,
                  self.inspector_dock)
         hiding = self.view_bar.isVisible()
         if hiding:
@@ -733,14 +775,19 @@ class MainWindow(QMainWindow):
             widget.setVisible(not hiding)
 
     def _reset_layout(self) -> None:
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.media_dock)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.color_dock)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.info_dock)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.ocio_dock)
-        self.tabifyDockWidget(self.color_dock, self.ocio_dock)
-        for dock in (self.media_dock, self.color_dock, self.ocio_dock, self.info_dock):
+        for dock, area in ((self.media_dock, Qt.LeftDockWidgetArea), (self.browser_dock, Qt.LeftDockWidgetArea),
+                           (self.color_dock, Qt.RightDockWidgetArea), (self.ocio_dock, Qt.RightDockWidgetArea),
+                           (self.info_dock, Qt.RightDockWidgetArea), (self.inspector_dock, Qt.RightDockWidgetArea),
+                           (self.scopes_dock, Qt.BottomDockWidgetArea)):
             dock.setFloating(False)
+            self.addDockWidget(area, dock)
             dock.show()
+        self.tabifyDockWidget(self.media_dock, self.browser_dock)
+        self.tabifyDockWidget(self.color_dock, self.ocio_dock)
+        self.tabifyDockWidget(self.info_dock, self.inspector_dock)
+        for dock in (self.media_dock, self.color_dock, self.info_dock):
+            dock.raise_()
+        self.scopes_dock.hide()
 
     def _set_cache_size(self, size_gb: int) -> None:
         self.cache_gb = size_gb
@@ -758,6 +805,68 @@ class MainWindow(QMainWindow):
         compare_share = total - main_share if self.compare_source is not None else int(total * COMPARE_CACHE_SHARE)
         if compare_share != self.compare_cache.max_bytes:
             self.compare_cache.set_budget(compare_share)
+
+    def set_aspect_guide(self, ratio: float) -> None:
+        self.viewer.aspect_guide = ratio
+        self.viewer.update()
+
+    def _set_audio_enabled(self, enabled: bool) -> None:
+        self.audio_enabled = enabled
+        self.settings.setValue("muted", not enabled)
+        self._sync_audio()
+
+    def _audio_track(self, source: MediaSource) -> AudioTrack | None:
+        if source.uid not in self._audio_tracks:
+            track = None
+            if source.kind == "video" and has_audio(source.path):
+                try:
+                    track = AudioTrack(source.path)
+                except MediaReadError:
+                    track = None
+            self._audio_tracks[source.uid] = track
+        return self._audio_tracks[source.uid]
+
+    def _sync_audio(self) -> None:
+        """Audio follows forward playback at 1x; any other state, or a jump, restarts or silences it."""
+        source = self.source
+        should_play = (source is not None and self.audio_enabled and self.clock.direction == 1
+                       and self.clock.speed == 1.0)
+        track = self._audio_track(source) if should_play else None
+        if track is None:
+            self.audio_player.stop()
+            return
+        seconds = getattr(source, "start_seconds", 0.0) + (self.clock.current - source.first) / source.fps
+        self.audio_player.play(track, seconds)
+
+    def open_playlist_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Open playlist", self.settings.value("last_folder", ""),
+                                              f"ProEXR playlist (*{PLAYLIST_SUFFIX} *.json)")
+        if path:
+            self.open_playlist(Path(path))
+
+    def open_playlist(self, path: Path) -> None:
+        try:
+            media = load_playlist(path)
+        except PlaylistError as error:
+            QMessageBox.warning(self, "Could not open playlist", str(error))
+            return
+        self.open_paths([str(item) for item in media])
+
+    def save_playlist_dialog(self) -> None:
+        if not self.media_list.count():
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save playlist", self.settings.value("last_folder", ""),
+                                              f"ProEXR playlist (*{PLAYLIST_SUFFIX})")
+        if path:
+            if not path.endswith(".json"):
+                path += PLAYLIST_SUFFIX
+            self.save_playlist(Path(path))
+
+    def save_playlist(self, path: Path) -> None:
+        try:
+            save_playlist(path, [source.path for source in self.media_list.sources()])
+        except PlaylistError as error:
+            QMessageBox.warning(self, "Could not save playlist", str(error))
 
     def clear_cache(self) -> None:
         self.cache.clear()
@@ -790,10 +899,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.settings.setValue("geometry", self.saveGeometry())
-        self.settings.setValue("window_state", self.saveState())
+        self.settings.setValue("window_state", self.saveState(LAYOUT_VERSION))
         self.stop()
         self.cache.shutdown()
         self.compare_cache.shutdown()
+        self.file_browser.shutdown()
+        for track in self._audio_tracks.values():
+            if track is not None:
+                track.close()
         for source in self.media_list.sources():
             source.close()
         super().closeEvent(event)
