@@ -240,3 +240,15 @@ def test_audio_follows_forward_playback_only(window, qapp, audio_file, monkeypat
     window.play(-1)
     assert len(calls) == 1
     window.stop()
+
+
+def test_performance_report_describes_media_and_timings(window, qapp, video_file):
+    window.open_paths([str(video_file)])
+    assert wait_for(qapp, lambda: window.viewer.frame is not None)
+    window.play(1)
+    assert wait_for(qapp, lambda: window.cache.read_stats.average_ms > 0)
+    window.stop()
+    report = window.performance_report()
+    assert "clip.mp4" in report and "Read per frame" in report and "yuv420p" in report
+    window._refresh_status()
+    assert window.perf_label.text().startswith("read ")

@@ -1,5 +1,6 @@
 import ctypes
 import math
+import time
 from enum import IntEnum
 
 import numpy as np
@@ -18,6 +19,8 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from ..color.ocio_pipeline import BakedLut
 from ..media.frame import Frame
+from ..media.yuv import MATRIX_IDS, planes
+from ..playback.stats import RollingStats
 from . import palette
 
 VERTEX_SHADER = """
@@ -57,6 +60,16 @@ uniform vec3 clipOver;
 uniform vec3 clipUnder;
 uniform sampler3D displayLut;
 uniform sampler2D imageB;
+uniform sampler2D imageU;
+uniform sampler2D imageV;
+uniform sampler2D imageBU;
+uniform sampler2D imageBV;
+uniform int layoutA;
+uniform int layoutB;
+uniform int yuvMatrixA;
+uniform int yuvMatrixB;
+uniform int yuvFullA;
+uniform int yuvFullB;
 uniform int channelCountB;
 uniform int sourceBIsSrgb;
 uniform int compareMode;
@@ -90,6 +103,25 @@ vec3 applyLut(vec3 v) {
     return texture(displayLut, s * ((lutSize - 1.0) / lutSize) + 0.5 / lutSize).rgb;
 }
 
+vec3 yuvToRgb(float y, vec2 c, int matrix, int full) {
+    vec3 k = matrix == 0 ? vec3(0.299, 0.587, 0.114) : matrix == 1 ? vec3(0.2126, 0.7152, 0.0722)
+                                                      : vec3(0.2627, 0.6780, 0.0593);
+    float luma = full == 1 ? y : (y * 255.0 - 16.0) / 219.0;
+    vec2 chroma = full == 1 ? c - 128.0 / 255.0 : (c * 255.0 - 128.0) / 224.0;
+    float r = luma + 2.0 * (1.0 - k.x) * chroma.y;
+    float b = luma + 2.0 * (1.0 - k.z) * chroma.x;
+    return clamp(vec3(r, (luma - k.x * r - k.z * b) / k.y, b), 0.0, 1.0);
+}
+
+// layout: 0 packed RGB(A), 1 planar Y + U + V, 2 Y + interleaved UV (NV12)
+vec4 sampleSource(sampler2D luma, sampler2D u, sampler2D v, int kind, int matrix, int full, vec2 p) {
+    if (kind == 0) return texture(luma, p);
+    vec2 c = kind == 1 ? vec2(texture(u, p).r, texture(v, p).r) : texture(u, p).rg;
+    return vec4(yuvToRgb(texture(luma, p).r, c, matrix, full), 1.0);
+}
+vec4 sampleA(vec2 p) { return sampleSource(image, imageU, imageV, layoutA, yuvMatrixA, yuvFullA, p); }
+vec4 sampleB(vec2 p) { return sampleSource(imageB, imageBU, imageBV, layoutB, yuvMatrixB, yuvFullB, p); }
+
 vec4 decode(vec4 texel, int count, int isSrgb) {
     vec4 c = count == 1 ? vec4(texel.rrr, 1.0)
            : count == 2 ? vec4(texel.rg, 0.0, 1.0)
@@ -100,10 +132,10 @@ vec4 decode(vec4 texel, int count, int isSrgb) {
 }
 
 void main() {
-    vec4 c = decode(texture(image, uv), channelCount, sourceIsSrgb);
+    vec4 c = decode(sampleA(uv), channelCount, sourceIsSrgb);
     bool showB = passSource == 1 || compareMode == 1 || (compareMode == 2 && uv.x >= wipeX);
-    if (showB) c = decode(texture(imageB, uv), channelCountB, sourceBIsSrgb);
-    if (compareMode == 4) c = vec4(abs(c.rgb - decode(texture(imageB, uv), channelCountB, sourceBIsSrgb).rgb), 1.0);
+    if (showB) c = decode(sampleB(uv), channelCountB, sourceBIsSrgb);
+    if (compareMode == 4) c = vec4(abs(c.rgb - decode(sampleB(uv), channelCountB, sourceBIsSrgb).rgb), 1.0);
 
     vec3 v = c.rgb * exp2(exposure) * gain * balance + offset;
     if (contrast != 1.0) v = sign(v) * pow(abs(v) / 0.18, vec3(contrast)) * 0.18;
@@ -132,7 +164,12 @@ void main() {
 UNIFORMS = ("imageSize", "viewSize", "pan", "zoom", "image", "channelCount", "sourceIsSrgb", "exposure",
             "gain", "offset", "contrast", "saturation", "balance", "gamma", "channel", "viewTransform",
             "showClipping", "clipOver", "clipUnder", "displayLut", "lutShaper", "lutMin", "lutMax", "lutSize",
-            "imageB", "channelCountB", "sourceBIsSrgb", "compareMode", "passSource", "wipeX")
+            "imageB", "channelCountB", "sourceBIsSrgb", "compareMode", "passSource", "wipeX",
+            "imageU", "imageV", "imageBU", "imageBV", "layoutA", "layoutB", "yuvMatrixA", "yuvMatrixB",
+            "yuvFullA", "yuvFullB")
+# Texture units per source slot: main plane, chroma plane 1, chroma plane 2. Unit 1 holds the display LUT.
+PLANE_UNITS = ((0, 3, 4), (2, 5, 6))
+LAYOUT_IDS = {"rgb": 0, "yuv420p": 1, "nv12": 2}
 PIXEL_FORMATS = {1: GL.GL_RED, 2: GL.GL_RG, 3: GL.GL_RGB, 4: GL.GL_RGBA}
 TEXTURE_FORMATS = {
     np.dtype(np.uint8): (GL.GL_UNSIGNED_BYTE, {1: GL.GL_R8, 2: GL.GL_RG8, 3: GL.GL_RGB8, 4: GL.GL_RGBA8}),
@@ -215,10 +252,12 @@ class Viewer(QOpenGLWidget):
         self.pan = QPointF(0, 0)
         self.is_fit = True
         self.gl_renderer = ""
-        self._textures = [0, 0]
+        self._textures: list[list[int]] = [[0, 0, 0], [0, 0, 0]]
         self._uploads_pending = [False, False]
         self._texture_signatures: list[tuple | None] = [None, None]
         self._mipmaps_stale = [True, True]
+        self._plane_counts = [1, 1]
+        self.upload_stats = RollingStats()
         self._drag_origin: tuple[QPointF, QPointF] | None = None
         self._mouse: QPointF | None = None
         self.display_lut: BakedLut | None = None
@@ -270,7 +309,8 @@ class Viewer(QOpenGLWidget):
         GL.glEnableVertexAttribArray(0)
         GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, ctypes.c_void_p(0))
         GL.glBindVertexArray(0)
-        self._textures = list(GL.glGenTextures(2))
+        names = list(GL.glGenTextures(6))
+        self._textures = [names[:3], names[3:]]
         self._lut_texture = GL.glGenTextures(1)
         self._lut_pending = self.display_lut is not None
         self._uniforms = {name: GL.glGetUniformLocation(self._program, name) for name in UNIFORMS}
@@ -294,21 +334,33 @@ class Viewer(QOpenGLWidget):
         return program
 
     def _upload(self, slot: int, frame: Frame) -> None:
-        pixels = frame.pixels if frame.pixels.dtype in TEXTURE_FORMATS else frame.pixels.astype(np.float32)
-        gl_type, internal_formats = TEXTURE_FORMATS[pixels.dtype]
-        height, width, channels = pixels.shape
-        GL.glActiveTexture(GL.GL_TEXTURE0 + (2 if slot else 0))
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[slot])
-        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
-        signature = (width, height, channels, pixels.dtype)
-        if signature != self._texture_signatures[slot]:
-            GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, internal_formats[channels], width, height, 0,
-                            PIXEL_FORMATS[channels], gl_type, pixels)
-            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-            self._texture_signatures[slot] = signature
+        started = time.perf_counter()
+        self._upload_planes(slot, frame)
+        self.upload_stats.add(time.perf_counter() - started)
+
+    def _upload_planes(self, slot: int, frame: Frame) -> None:
+        if frame.is_planar:
+            plane_arrays = [p if p.ndim == 3 else p[..., None] for p in planes(frame.pixels, frame.layout)]
         else:
-            GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, width, height, PIXEL_FORMATS[channels], gl_type, pixels)
+            pixels = frame.pixels if frame.pixels.dtype in TEXTURE_FORMATS else frame.pixels.astype(np.float32)
+            plane_arrays = [pixels]
+        signature = (frame.width, frame.height, frame.channel_count, plane_arrays[0].dtype, frame.layout)
+        reallocate = signature != self._texture_signatures[slot]
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+        for index, pixels in enumerate(plane_arrays):
+            gl_type, internal_formats = TEXTURE_FORMATS[pixels.dtype]
+            height, width, channels = pixels.shape
+            GL.glActiveTexture(GL.GL_TEXTURE0 + PLANE_UNITS[slot][index])
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[slot][index])
+            if reallocate:
+                GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, internal_formats[channels], width, height, 0,
+                                PIXEL_FORMATS[channels], gl_type, pixels)
+                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+                GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+            else:
+                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, width, height, PIXEL_FORMATS[channels], gl_type, pixels)
+        self._texture_signatures[slot] = signature
+        self._plane_counts[slot] = len(plane_arrays)
         self._mipmaps_stale[slot] = True
         GL.glActiveTexture(GL.GL_TEXTURE0)
 
@@ -324,16 +376,22 @@ class Viewer(QOpenGLWidget):
             GL.glTexParameteri(GL.GL_TEXTURE_3D, wrap, GL.GL_CLAMP_TO_EDGE)
         GL.glActiveTexture(GL.GL_TEXTURE0)
 
-    def _set_filtering(self, slot: int, device_zoom: float) -> None:
-        minify = GL.GL_LINEAR
-        if device_zoom < MIPMAP_BELOW_ZOOM:
-            if self._mipmaps_stale[slot]:
-                GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
-                self._mipmaps_stale[slot] = False
-            minify = GL.GL_LINEAR_MIPMAP_LINEAR
+    def _bind_source(self, slot: int, device_zoom: float) -> None:
+        """Binds every plane of a source to its texture unit and sets filtering (mipmaps when zoomed out)."""
+        use_mipmaps = device_zoom < MIPMAP_BELOW_ZOOM
+        rebuild = use_mipmaps and self._mipmaps_stale[slot]
+        minify = GL.GL_LINEAR_MIPMAP_LINEAR if use_mipmaps else GL.GL_LINEAR
         magnify = GL.GL_NEAREST if self.nearest_when_magnified and device_zoom >= NEAREST_FROM_ZOOM else GL.GL_LINEAR
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, minify)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, magnify)
+        for index in range(self._plane_counts[slot]):
+            GL.glActiveTexture(GL.GL_TEXTURE0 + PLANE_UNITS[slot][index])
+            GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[slot][index])
+            if rebuild:
+                GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, minify)
+            GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, magnify)
+        if rebuild:
+            self._mipmaps_stale[slot] = False
+        GL.glActiveTexture(GL.GL_TEXTURE0)
 
     def _set_uniforms(self, view_w: int, view_h: int, ratio: float, zoom: float | None = None,
                       pan: QPointF | None = None) -> None:
@@ -344,10 +402,18 @@ class Viewer(QOpenGLWidget):
         GL.glUniform2f(u["viewSize"], view_w, view_h)
         GL.glUniform2f(u["pan"], pan.x(), pan.y())
         GL.glUniform1f(u["zoom"], self.zoom * ratio if zoom is None else zoom)
-        GL.glUniform1i(u["image"], 0)
+        for name, unit in zip(("image", "imageU", "imageV", "imageB", "imageBU", "imageBV"),
+                              PLANE_UNITS[0] + PLANE_UNITS[1], strict=True):
+            GL.glUniform1i(u[name], unit)
+        for slot, suffix in ((0, "A"), (1, "B")):
+            source = self.frame if slot == 0 else self.compare_frame
+            signature = self._texture_signatures[slot]
+            layout = signature[4] if signature and source is not None else "rgb"
+            GL.glUniform1i(u["layout" + suffix], LAYOUT_IDS[layout])
+            GL.glUniform1i(u["yuvMatrix" + suffix], MATRIX_IDS[source.yuv_matrix] if source is not None else 1)
+            GL.glUniform1i(u["yuvFull" + suffix], int(source is not None and source.yuv_full_range))
         GL.glUniform1i(u["channelCount"], self._texture_signatures[0][2])
         compare = self.compare_frame if self.is_comparing and self._texture_signatures[1] else None
-        GL.glUniform1i(u["imageB"], 2)
         GL.glUniform1i(u["channelCountB"], self._texture_signatures[1][2] if compare else 4)
         GL.glUniform1i(u["sourceBIsSrgb"], int(compare is not None and compare.colorspace == "srgb"))
         mode = self.compare_mode if compare is not None else CompareMode.OFF
@@ -390,11 +456,9 @@ class Viewer(QOpenGLWidget):
             GL.glUseProgram(self._program)
             GL.glActiveTexture(GL.GL_TEXTURE1)
             GL.glBindTexture(GL.GL_TEXTURE_3D, self._lut_texture)
-            for slot, unit in ((1, GL.GL_TEXTURE2), (0, GL.GL_TEXTURE0)):
-                GL.glActiveTexture(unit)
-                GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[slot])
+            for slot in (1, 0):
                 if self._texture_signatures[slot] is not None:
-                    self._set_filtering(slot, self.zoom * ratio)
+                    self._bind_source(slot, self.zoom * ratio)
             GL.glBindVertexArray(self._vao)
             if self.is_comparing and self.compare_mode is CompareMode.SIDE_BY_SIDE:
                 half = view_w // 2
@@ -412,7 +476,18 @@ class Viewer(QOpenGLWidget):
                 self._emit_display_sample(view_w, view_h)
             GL.glBindVertexArray(0)
             GL.glUseProgram(0)
+        self._restore_qt_gl_state()
         self._paint_overlays()
+
+    def _restore_qt_gl_state(self) -> None:
+        """QPainter shares this GL context and assumes default state: with UNPACK_ALIGNMENT left at 1 its glyph
+        cache uploads are skewed and text renders garbled (seen on NVIDIA drivers)."""
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 4)
+        GL.glPixelStorei(GL.GL_PACK_ALIGNMENT, 4)
+        for unit in (GL.GL_TEXTURE0 + i for i in range(6, -1, -1)):
+            GL.glActiveTexture(unit)
+            GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+            GL.glBindTexture(GL.GL_TEXTURE_3D, 0)
 
     def _sample_framebuffer(self, width: int, height: int) -> int:
         if self._sample_target is not None and self._sample_target[2:] == (width, height):
@@ -437,7 +512,7 @@ class Viewer(QOpenGLWidget):
         GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._sample_framebuffer(width, height))
         GL.glViewport(0, 0, width, height)
         GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[0])
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._textures[0][0])  # creating the sample target rebound unit 0
         self._set_uniforms(width, height, 1.0, zoom=width / image_w, pan=QPointF(0, 0))
         GL.glUniform1i(self._uniforms["compareMode"], 0)
         GL.glUniform1i(self._uniforms["passSource"], 0)
@@ -630,8 +705,9 @@ class Viewer(QOpenGLWidget):
         if not (0 <= x < self.frame.width and 0 <= y < self.frame.height):
             self.pixelHovered.emit(None)
             return
-        raw = self.frame.pixels[y, x].astype(np.float64)
-        scale = {np.dtype(np.uint8): 255.0, np.dtype(np.uint16): 65535.0}.get(self.frame.pixels.dtype, 1.0)
+        raw = self.frame.rgb_region(x, y, x + 1, y + 1)[0, 0].astype(np.float64)
+        dtype = np.dtype(np.uint8) if self.frame.is_planar else self.frame.pixels.dtype
+        scale = {np.dtype(np.uint8): 255.0, np.dtype(np.uint16): 65535.0}.get(dtype, 1.0)
         self.pixelHovered.emit({"x": x, "y": y, "values": raw / scale, "raw": raw,
                                 "is_integer": scale != 1.0})
 

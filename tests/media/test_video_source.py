@@ -4,7 +4,7 @@ from proexr.media.video_source import VideoSource
 
 
 def red_level(frame) -> int:
-    return int(frame.pixels[24, 32, 0])
+    return int(frame.rgb_region(32, 24, 33, 25)[0, 0, 0])
 
 
 def test_video_metadata(video_file):
@@ -51,3 +51,16 @@ def test_reading_after_close_raises_instead_of_crashing(video_file):
     source.close()
     with pytest.raises(MediaReadError):
         source.read(4)
+
+
+def test_8bit_420_video_stays_planar(video_file):
+    frame = VideoSource(video_file, hardware_decode=False).read(5)
+    assert frame.layout == "yuv420p" and frame.pixels.shape == (72, 64)
+    assert (frame.width, frame.height) == (64, 48)
+
+
+def test_planar_output_can_be_turned_off(video_file):
+    source = VideoSource(video_file, hardware_decode=False)
+    source.planar_output = False
+    frame = source.read(5)
+    assert frame.layout == "rgb" and frame.pixels.shape == (48, 64, 3)

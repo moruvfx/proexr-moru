@@ -1,16 +1,19 @@
 import threading
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import av
-import numpy as np
 
 from ..errors import MediaReadError
 from .frame import Frame, MediaSource
 from .layers import Layer
+from .yuv import pick_matrix
 
 HARDWARE_DEVICES = ("cuda", "d3d11va", "dxva2", "videotoolbox", "vaapi")
 MAX_DECODE_AHEAD = 48
+PLANAR_FORMATS = {"yuv420p": "yuv420p", "yuvj420p": "yuv420p", "nv12": "nv12"}
+JPEG_RANGE = 2
 HIGH_BIT_DEPTH_MARKERS = ("10", "12", "16", "p010", "p016")
 
 
@@ -22,7 +25,8 @@ class VideoSource(MediaSource):
         self.hardware_device: str | None = None
         self._decoded: Iterator[av.VideoFrame] | None = None
         self._next_number: int | None = None
-        self._last_pixels: np.ndarray | None = None
+        self._last_frame: Frame | None = None
+        self.planar_output = True
         self._closed = False
         self._open()
         stream = self._stream
@@ -101,9 +105,16 @@ class VideoSource(MediaSource):
         self._decoded = self._decode()
         self._next_number = None
 
-    def _to_rgb(self, frame: av.VideoFrame) -> np.ndarray:
+    def _to_frame(self, decoded: av.VideoFrame, number: int) -> Frame:
+        """Keep 8-bit 4:2:0 frames planar (the GPU converts them, at half the memory); convert the rest to RGB."""
+        name = decoded.format.name
+        even = decoded.width % 2 == 0 and decoded.height % 2 == 0
+        if self.planar_output and even and name in PLANAR_FORMATS:
+            return Frame(decoded.to_ndarray(), self.colorspace, number, layout=PLANAR_FORMATS[name],
+                         yuv_matrix=pick_matrix(int(decoded.colorspace), decoded.height),
+                         yuv_full_range=name == "yuvj420p" or int(decoded.color_range) == JPEG_RANGE)
         target = "rgb48le" if self._is_high_bit_depth else "rgb24"
-        return frame.to_ndarray(format=target)
+        return Frame(decoded.to_ndarray(format=target), self.colorspace, number)
 
     def _read_locked(self, number: int) -> Frame:
         needs_seek = (self._decoded is None or self._next_number is None or number < self._next_number
@@ -117,11 +128,11 @@ class VideoSource(MediaSource):
             if self._next_number > number:
                 break
         if chosen is None:
-            if self._last_pixels is None:
+            if self._last_frame is None:
                 raise MediaReadError(f"No frames decoded from {self.path}")
-            return Frame(self._last_pixels, self.colorspace, number, is_held=True)
-        self._last_pixels = self._to_rgb(chosen)
-        return Frame(self._last_pixels, self.colorspace, number)
+            return replace(self._last_frame, number=number, is_held=True)
+        self._last_frame = self._to_frame(chosen, number)
+        return self._last_frame
 
     def read(self, number: int, layer: int = 0) -> Frame:
         number = min(max(number, self.first), self.last)

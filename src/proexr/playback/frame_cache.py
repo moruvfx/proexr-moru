@@ -1,10 +1,12 @@
 import os
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 from ..errors import ProexrError
 from ..media.frame import Frame, MediaSource
+from .stats import RollingStats
 
 CacheKey = tuple[int, int, int]
 IDLE_WAIT_SECONDS = 0.25
@@ -19,6 +21,7 @@ class FrameCache:
         self.max_bytes = max_bytes
         self.workers = workers or default_worker_count()
         self.on_frame_ready: Callable[[CacheKey], None] | None = None
+        self.read_stats = RollingStats()
         self._frames: dict[CacheKey, Frame] = {}
         self._pending: set[CacheKey] = set()
         self._errors: dict[CacheKey, str] = {}
@@ -167,7 +170,10 @@ class FrameCache:
 
     def _read(self, source: MediaSource, key: CacheKey) -> Frame | None:
         try:
-            return source.read(key[2], key[1])
+            started = time.perf_counter()
+            frame = source.read(key[2], key[1])
+            self.read_stats.add(time.perf_counter() - started)
+            return frame
         except (ProexrError, OSError, ValueError, RuntimeError) as error:
             with self._condition:
                 self._errors[key] = str(error)

@@ -160,3 +160,27 @@ def test_display_sample_matches_what_is_shown(viewer, qapp):
     assert sample.shape[1] == 64 and sample.shape[2] == 3
     assert sample.shape[0] == pytest.approx(64 * 40 / 60, abs=1)
     assert sample[5, 5] == pytest.approx((118, 118, 118), abs=2)
+
+
+def test_gl_state_is_reset_for_qpainter_text(viewer, qapp):
+    from OpenGL import GL
+    viewer.show_frame(solid([0.5, 0.5, 0.5], channels=3))
+    settle(qapp)
+    viewer.grabFramebuffer()
+    viewer.makeCurrent()
+    try:
+        assert GL.glGetIntegerv(GL.GL_UNPACK_ALIGNMENT) == 4
+        assert GL.glGetIntegerv(GL.GL_ACTIVE_TEXTURE) == GL.GL_TEXTURE0
+    finally:
+        viewer.doneCurrent()
+
+
+@pytest.mark.parametrize("layout", ["yuv420p", "nv12"])
+def test_planar_video_frame_is_converted_on_gpu(viewer, qapp, layout):
+    import av
+    color = (200, 40, 90)
+    source = av.VideoFrame.from_ndarray(np.full((40, 60, 3), color, np.uint8), format="rgb24")
+    pixels = source.reformat(format=layout).to_ndarray()
+    viewer.view_transform = ViewTransform.SRGB
+    viewer.show_frame(Frame(pixels, "srgb", 0, layout=layout, yuv_matrix="bt601"))
+    assert center(viewer, qapp) == pytest.approx(color, abs=4)

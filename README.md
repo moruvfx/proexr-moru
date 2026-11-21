@@ -28,7 +28,8 @@ uv run proexr D:\shots\sh010\comp.1001.exr D:\refs\edit.mov
 - Compare A/B: B only, wipe (drag the line), side by side, difference. Right-click a media item to set it as B; Ctrl+B cycles B, `\` toggles.
 - Scopes: waveform, RGB parade, histogram, vectorscope; Pixel panel with exact values and a 5x5 average.
 - Smooth playback: frames are decoded ahead of the playhead on worker threads into a RAM cache (green bar on the timeline) that shrinks when free RAM runs low. Float images are cached as half to fit twice as many frames.
-- Video decoding on the GPU (NVIDIA NVDEC, D3D11) when available, CPU otherwise; the status bar shows which. Audio plays during forward 1x playback (M mutes).
+- Video decoding on the GPU (NVIDIA NVDEC, D3D11) when available, CPU otherwise; the status bar shows which. 8-bit 4:2:0 video stays in YUV and is converted to RGB in the shader, halving cache memory and upload size.
+- The status bar shows read and upload time per frame; Help > Copy performance report gives the full picture to share when playback is slow. Audio plays during forward 1x playback (M mutes).
 - Play forward/reverse, loop, ping-pong, play once, in/out points, speed 0.1x-4x, any frame rate.
 - Browser panel with thumbnails; playlists (File > Save/Open playlist).
 - Zoom (wheel), pan (drag), fit (F), 1:1 pixels (1), safe areas, thirds grid, aspect guides (2.39, 1.85, 16:9...), clipping highlight, full screen, hide panels (Tab).

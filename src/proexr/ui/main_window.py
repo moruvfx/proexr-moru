@@ -1,3 +1,5 @@
+import dataclasses
+import os
 import subprocess
 import sys
 import threading
@@ -15,6 +17,7 @@ from PySide6.QtGui import (
     QKeySequence,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDockWidget,
     QDoubleSpinBox,
@@ -102,6 +105,7 @@ class MainWindow(QMainWindow):
         self.audio_enabled = not self.settings.value("muted", False, type=bool)
         self._audio_tracks: dict[int, AudioTrack | None] = {}
         self._last_shown: int | None = None
+        self.dropped_frames = 0
         self.clock = PlaybackClock(0, 0, 24.0, is_ready=self._is_cached)
         self._shown_at: list[float] = []
         self._docks_before_hide: list[QDockWidget] = []
@@ -246,11 +250,15 @@ class MainWindow(QMainWindow):
         self.fps_label = QLabel()
         self.cache_label = QLabel()
         self.decoder_label = QLabel()
+        self.perf_label = QLabel()
+        self.perf_label.setToolTip("Average time to read one frame (on worker threads) and to upload it to the GPU; "
+                                   "frames skipped to keep realtime since play started")
         self.zoom_label = QLabel("100%")
         self.gpu_label = QLabel()
         status = self.statusBar()
         status.addWidget(self.pixel_label, 1)
         status.addPermanentWidget(self.fps_label)
+        status.addPermanentWidget(self.perf_label)
         status.addPermanentWidget(self.decoder_label)
         status.addPermanentWidget(self.cache_label)
         status.addPermanentWidget(self.zoom_label)
@@ -400,6 +408,9 @@ class MainWindow(QMainWindow):
         edit_keys = QAction("Edit shortcuts file...", self)
         edit_keys.triggered.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(shortcuts.shortcuts_path()))))
         help_menu.addAction(edit_keys)
+        report = QAction("Copy performance report", self)
+        report.triggered.connect(self.copy_performance_report)
+        help_menu.addAction(report)
         check = QAction("Check for updates...", self)
         check.triggered.connect(lambda: self.check_for_updates(user_asked=True))
         help_menu.addAction(check)
@@ -557,7 +568,7 @@ class MainWindow(QMainWindow):
             return
         if key == (self.source.uid, self.layer, self.clock.current) and \
                 (self.viewer.frame is None or self.viewer.frame.number != key[2] or
-                 self.viewer.frame.pixels.shape[2] != len(self.source.layers[self.layer].channel_indices)):
+                 self.viewer.frame.channel_count != len(self.source.layers[self.layer].channel_indices)):
             self.viewer.show_frame(self.cache.get(self.source, key[2], self.layer))
 
     def seek(self, number: int) -> None:
@@ -585,6 +596,7 @@ class MainWindow(QMainWindow):
             return
         self.clock.start(direction, time.perf_counter())
         self._shown_at.clear()
+        self.dropped_frames = 0
         self._follow()
         self._play_timer.start(max(1, int(1000 / self.clock.rate / 4)))
         self.transport.show_direction(direction)
@@ -609,6 +621,8 @@ class MainWindow(QMainWindow):
             self._shown_at.append(time.perf_counter())
             del self._shown_at[:-60]
             jumped = self._last_shown is not None and number < self._last_shown
+            if self._last_shown is not None and not jumped:
+                self.dropped_frames += max(0, abs(number - self._last_shown) - 1)
             self._show(number)
             if jumped:
                 self._sync_audio()
@@ -750,8 +764,12 @@ class MainWindow(QMainWindow):
         frame = self.viewer.frame
         if frame is not None and self.source is not None:
             layer = self.source.layers[min(self.layer, len(self.source.layers) - 1)]
-            names = layer.channel_names if len(layer.channel_names) == frame.pixels.shape[2] else list("RGBA")
-            self.pixel_inspector.show_report(pixel_report(frame.pixels, pixel["x"], pixel["y"], names))
+            names = layer.channel_names if len(layer.channel_names) == frame.channel_count else list("RGBA")
+            x, y, radius = pixel["x"], pixel["y"], 2
+            x0, y0 = max(0, x - radius), max(0, y - radius)
+            area = frame.rgb_region(x0, y0, x + radius + 1, y + radius + 1)
+            report = pixel_report(area, x - x0, y - y0, names, radius)
+            self.pixel_inspector.show_report(dataclasses.replace(report, x=x, y=y))
         values = pixel["values"]
         names = "RGBA" if len(values) > 1 else "V"
         text = "  ".join(f"{names[i]} {values[i]:.4f}" for i in range(len(values)))
@@ -767,6 +785,9 @@ class MainWindow(QMainWindow):
         percent = 100 * self.cache.used_bytes / self.cache.max_bytes if self.cache.max_bytes else 0
         self.cache_label.setText(f"Cache {used:.1f} / {budget:.1f} GB ({percent:.0f}%)")
         self.cache_label.setToolTip(f"Configured {self.cache_gb} GB; shrinks automatically when free RAM runs low")
+        read_ms, upload_ms = self.cache.read_stats.average_ms, self.viewer.upload_stats.average_ms
+        self.perf_label.setText(f"read {read_ms:.0f} ms  upload {upload_ms:.1f} ms  skipped {self.dropped_frames}"
+                                if self.source is not None else "")
         device = getattr(self.source, "hardware_device", None)
         is_video = self.source is not None and self.source.kind == "video"
         self.decoder_label.setText(("GPU decode: " + device if device else "CPU decode") if is_video else "")
@@ -909,6 +930,29 @@ class MainWindow(QMainWindow):
     def _show_about(self) -> None:
         QMessageBox.about(self, "ProEXR Viewer", f"<b>ProEXR Viewer</b> {__version__}<br>Read-only VFX media viewer."
                           f"<br><br>GPU: {self.viewer.gl_renderer}")
+
+    def performance_report(self) -> str:
+        source, frame = self.source, self.viewer.frame
+        lines = [f"ProEXR Viewer {__version__}", f"GPU: {self.viewer.gl_renderer}",
+                 f"CPU threads: {os.cpu_count()}, cache workers: {self.cache.workers}",
+                 f"RAM free: {available_memory_bytes() / (1 << 30):.1f} GB, cache {self.cache.used_bytes / (1 << 30):.1f}"
+                 f" / {self.cache.max_bytes / (1 << 30):.1f} GB"]
+        if source is not None:
+            lines.append(f"Media: {source.label} ({source.kind}) {source.width}x{source.height} {source.fps:g} fps")
+            lines += [f"  {key}: {value}" for key, value in source.properties.items()
+                      if key in ("Codec", "Pixel format", "Decoder", "compression", "Pixel type", "Channels")]
+        if frame is not None:
+            lines.append(f"Frame storage: {frame.layout}, {frame.pixels.dtype}, {frame.pixels.nbytes / (1 << 20):.1f} MB")
+        measured = self.fps_label.text().strip() or "not playing"
+        lines += [f"Read per frame: {self.cache.read_stats.average_ms:.1f} ms "
+                  f"({self.cache.read_stats.rate():.1f} frames/s into cache)",
+                  f"GPU upload per frame: {self.viewer.upload_stats.average_ms:.1f} ms",
+                  f"Playback: {measured}, skipped {self.dropped_frames}, realtime {self.clock.realtime}"]
+        return "\n".join(lines)
+
+    def copy_performance_report(self) -> None:
+        QApplication.clipboard().setText(self.performance_report())
+        self.statusBar().showMessage("Performance report copied: paste it in the chat", 4000)
 
     def check_for_updates(self, user_asked: bool) -> None:
         now = time.time()

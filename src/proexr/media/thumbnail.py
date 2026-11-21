@@ -8,7 +8,7 @@ from .frame import Frame
 def thumbnail_pixels(frame: Frame, max_size: int = 160) -> np.ndarray:
     """Small display-ready (h, w, 3) uint8 copy of a frame: nearest-neighbour downscale, sRGB encoded."""
     step = max(1, math.ceil(max(frame.width, frame.height) / max_size))
-    pixels = frame.pixels[::step, ::step]
+    pixels = frame.rgb_region(0, 0, frame.width, frame.height)[::step, ::step]
     if pixels.shape[2] >= 3:
         rgb = pixels[..., :3]
     else:

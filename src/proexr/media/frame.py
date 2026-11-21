@@ -18,6 +18,13 @@ class Frame:
     colorspace: Colorspace
     number: int
     is_held: bool = False
+    layout: str = "rgb"  # "rgb" (h, w, c) or planar video "yuv420p" / "nv12" stored as (h*3/2, w) uint8
+    yuv_matrix: str = "bt709"
+    yuv_full_range: bool = False
+
+    @property
+    def is_planar(self) -> bool:
+        return self.layout != "rgb"
 
     @property
     def width(self) -> int:
@@ -25,7 +32,18 @@ class Frame:
 
     @property
     def height(self) -> int:
-        return self.pixels.shape[0]
+        return self.pixels.shape[0] * 2 // 3 if self.is_planar else self.pixels.shape[0]
+
+    @property
+    def channel_count(self) -> int:
+        return 3 if self.is_planar else self.pixels.shape[2]
+
+    def rgb_region(self, x0: int, y0: int, x1: int, y1: int) -> np.ndarray:
+        """Pixels of a region as (h, w, c) in the frame's own type; planar video is converted to uint8 RGB."""
+        if not self.is_planar:
+            return self.pixels[y0:y1, x0:x1]
+        from .yuv import to_rgb
+        return to_rgb(self.pixels, self.layout, self.yuv_matrix, self.yuv_full_range, (x0, y0, x1, y1))
 
     @property
     def nbytes(self) -> int:
