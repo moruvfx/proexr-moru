@@ -47,7 +47,7 @@ def _layers_in_part(part: int, channel_names: list[str], part_name: str | None) 
             if part_name and base:
                 name = f"{part_name}/{base}"
             layers.append(Layer(name, part, indices, [channel_names[i] for i in indices]))
-        for index, suffix in channels:
+        for index, _suffix in channels:
             if index in used:
                 continue
             name = channel_names[index]
@@ -62,4 +62,4 @@ def group_layers(parts: list[list[str]], part_names: list[str] | None = None) ->
     for part, channel_names in enumerate(parts):
         part_name = part_names[part] if part_names and len(parts) > 1 else None
         layers.extend(_layers_in_part(part, channel_names, part_name))
-    return sorted(layers, key=lambda l: (l.part, l.name not in MAIN_LAYER_NAMES, len(l.channel_indices) == 1))
+    return sorted(layers, key=lambda layer: (layer.part, layer.name not in MAIN_LAYER_NAMES, len(layer.channel_indices) == 1))

@@ -5,7 +5,15 @@ from enum import IntEnum
 import numpy as np
 from OpenGL import GL
 from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QPainter, QPen, QSurfaceFormat, QWheelEvent
+from PySide6.QtGui import (
+    QDragEnterEvent,
+    QDropEvent,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QSurfaceFormat,
+    QWheelEvent,
+)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from ..media.frame import Frame

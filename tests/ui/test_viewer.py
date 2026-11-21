@@ -1,9 +1,9 @@
 import numpy as np
 import pytest
+from ui_helpers import settle
 
 from proexr.media.frame import Frame
-from proexr.ui.viewer import Channel, ViewTransform, Viewer
-from ui_helpers import settle
+from proexr.ui.viewer import Channel, Viewer, ViewTransform
 
 
 @pytest.fixture

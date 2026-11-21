@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
-
 from conftest import HEIGHT, WIDTH, write_exr
+
 from proexr.errors import MediaReadError
 from proexr.media.image_source import ImageSequenceSource
 from proexr.media.sequence import find_sequence
@@ -11,7 +11,7 @@ def test_sequence_metadata(exr_sequence):
     source = ImageSequenceSource(find_sequence(exr_sequence / "shot.1003.exr"))
     assert (source.first, source.last) == (1001, 1010)
     assert (source.width, source.height) == (WIDTH, HEIGHT)
-    assert [l.name for l in source.layers] == ["RGBA", "diffuse", "Z"]
+    assert [layer.name for layer in source.layers] == ["RGBA", "diffuse", "Z"]
     assert source.colorspace == "linear"
     assert source.kind == "sequence"
 
