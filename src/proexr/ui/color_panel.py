@@ -23,6 +23,7 @@ class SliderField(QWidget):
         self.slider = ResettableSlider(Qt.Horizontal)
         self.slider.setRange(round(minimum * self._scale), round(maximum * self._scale))
         self.slider.setToolTip("Double-click to reset")
+        self.slider.setMinimumWidth(140)
         self.field = QDoubleSpinBox()
         self.field.setRange(minimum, maximum)
         self.field.setDecimals(decimals)

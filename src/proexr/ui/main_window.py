@@ -181,7 +181,10 @@ class MainWindow(QMainWindow):
         self.media_dock = self._add_dock("Media", self.media_list, Qt.LeftDockWidgetArea, "media_dock")
         self.color_dock = self._add_dock("Color", self.color_panel, Qt.RightDockWidgetArea, "color_dock")
         self.info_dock = self._add_dock("Info", self.info_panel, Qt.RightDockWidgetArea, "info_dock")
-        self.resizeDocks([self.media_dock, self.color_dock], [250, 320], Qt.Horizontal)
+        self.media_list.setMinimumWidth(230)
+        self.color_panel.setMinimumWidth(320)
+        self.resizeDocks([self.media_dock, self.color_dock], [250, 340], Qt.Horizontal)
+        self.resizeDocks([self.color_dock, self.info_dock], [460, 300], Qt.Vertical)
         self.exposure_field.valueChanged.connect(self.color_panel.exposure.set_value)
         self.gamma_field.valueChanged.connect(self.color_panel.gamma.set_value)
 

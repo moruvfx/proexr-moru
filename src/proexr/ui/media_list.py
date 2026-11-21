@@ -14,6 +14,8 @@ class MediaList(QListWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setDragDropMode(QListWidget.InternalMove)
+        self.setWordWrap(True)
+        self.setTextElideMode(Qt.ElideMiddle)
         self.currentItemChanged.connect(self._selection_changed)
 
     def add_source(self, source: MediaSource) -> None:
