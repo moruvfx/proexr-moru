@@ -16,6 +16,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
+from ..color.ocio_pipeline import BakedLut
 from ..media.frame import Frame
 from . import palette
 
@@ -54,6 +55,11 @@ uniform int viewTransform;
 uniform int showClipping;
 uniform vec3 clipOver;
 uniform vec3 clipUnder;
+uniform sampler3D displayLut;
+uniform int lutShaper;
+uniform float lutMin;
+uniform float lutMax;
+uniform float lutSize;
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
@@ -71,13 +77,20 @@ vec3 acesFilmic(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
 }
 
+vec3 applyLut(vec3 v) {
+    vec3 s = lutShaper == 1 ? (log2(max(v, vec3(exp2(lutMin)))) - lutMin) / (lutMax - lutMin)
+                            : (v - lutMin) / (lutMax - lutMin);
+    s = clamp(s, 0.0, 1.0);
+    return texture(displayLut, s * ((lutSize - 1.0) / lutSize) + 0.5 / lutSize).rgb;
+}
+
 void main() {
     vec4 texel = texture(image, uv);
     vec4 c = channelCount == 1 ? vec4(texel.rrr, 1.0)
            : channelCount == 2 ? vec4(texel.rg, 0.0, 1.0)
            : channelCount == 3 ? vec4(texel.rgb, 1.0)
            : texel;
-    if (sourceIsSrgb == 1) c.rgb = srgbToLinear(c.rgb);
+    if (sourceIsSrgb == 1 && viewTransform != 4) c.rgb = srgbToLinear(c.rgb);
 
     vec3 v = c.rgb * exp2(exposure) * gain * balance + offset;
     if (contrast != 1.0) v = sign(v) * pow(abs(v) / 0.18, vec3(contrast)) * 0.18;
@@ -91,8 +104,9 @@ void main() {
 
     bool over = any(greaterThan(v, vec3(1.0)));
     bool under = any(lessThan(v, vec3(0.0)));
-    vec3 display = max(v, 0.0);
-    if (viewTransform == 1) display = linearToSrgb(display);
+    vec3 display = viewTransform == 4 ? v : max(v, 0.0);
+    if (viewTransform == 4) display = applyLut(display);
+    else if (viewTransform == 1) display = linearToSrgb(display);
     else if (viewTransform == 2) display = linearToRec709(display);
     else if (viewTransform == 3) display = linearToSrgb(acesFilmic(display));
     if (gamma != 1.0) display = pow(display, vec3(1.0 / gamma));
@@ -104,7 +118,7 @@ void main() {
 
 UNIFORMS = ("imageSize", "viewSize", "pan", "zoom", "image", "channelCount", "sourceIsSrgb", "exposure",
             "gain", "offset", "contrast", "saturation", "balance", "gamma", "channel", "viewTransform",
-            "showClipping", "clipOver", "clipUnder")
+            "showClipping", "clipOver", "clipUnder", "displayLut", "lutShaper", "lutMin", "lutMax", "lutSize")
 PIXEL_FORMATS = {1: GL.GL_RED, 2: GL.GL_RG, 3: GL.GL_RGB, 4: GL.GL_RGBA}
 TEXTURE_FORMATS = {
     np.dtype(np.uint8): (GL.GL_UNSIGNED_BYTE, {1: GL.GL_R8, 2: GL.GL_RG8, 3: GL.GL_RGB8, 4: GL.GL_RGBA8}),
@@ -135,6 +149,7 @@ class ViewTransform(IntEnum):
     SRGB = 1
     REC709 = 2
     ACES_FILMIC = 3
+    OCIO = 4
 
 
 def surface_format() -> QSurfaceFormat:
@@ -176,6 +191,9 @@ class Viewer(QOpenGLWidget):
         self._mipmaps_stale = True
         self._drag_origin: tuple[QPointF, QPointF] | None = None
         self._mouse: QPointF | None = None
+        self.display_lut: BakedLut | None = None
+        self._lut_pending = False
+        self._lut_texture = 0
 
     def show_frame(self, frame: Frame | None) -> None:
         size_changed = frame is None or self.frame is None or \
@@ -186,6 +204,11 @@ class Viewer(QOpenGLWidget):
             self._fit_zoom()
         self.update()
         self._report_pixel()
+
+    def set_display_lut(self, lut: BakedLut | None) -> None:
+        self.display_lut = lut
+        self._lut_pending = lut is not None
+        self.update()
 
     def set_grade(self, **values: float | tuple[float, float, float]) -> None:
         self.grade.update(values)
@@ -203,6 +226,8 @@ class Viewer(QOpenGLWidget):
         GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, GL.GL_FALSE, 0, ctypes.c_void_p(0))
         GL.glBindVertexArray(0)
         self._texture = GL.glGenTextures(1)
+        self._lut_texture = GL.glGenTextures(1)
+        self._lut_pending = self.display_lut is not None
         self._uniforms = {name: GL.glGetUniformLocation(self._program, name) for name in UNIFORMS}
         self._texture_signature = None
         self._upload_pending = self.frame is not None
@@ -240,6 +265,18 @@ class Viewer(QOpenGLWidget):
             GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, width, height, PIXEL_FORMATS[channels], gl_type, pixels)
         self._mipmaps_stale = True
 
+    def _upload_lut(self, lut: BakedLut) -> None:
+        size = lut.table.shape[0]
+        GL.glActiveTexture(GL.GL_TEXTURE1)
+        GL.glBindTexture(GL.GL_TEXTURE_3D, self._lut_texture)
+        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+        GL.glTexImage3D(GL.GL_TEXTURE_3D, 0, GL.GL_RGB32F, size, size, size, 0, GL.GL_RGB, GL.GL_FLOAT, lut.table)
+        for parameter in (GL.GL_TEXTURE_MIN_FILTER, GL.GL_TEXTURE_MAG_FILTER):
+            GL.glTexParameteri(GL.GL_TEXTURE_3D, parameter, GL.GL_LINEAR)
+        for wrap in (GL.GL_TEXTURE_WRAP_S, GL.GL_TEXTURE_WRAP_T, GL.GL_TEXTURE_WRAP_R):
+            GL.glTexParameteri(GL.GL_TEXTURE_3D, wrap, GL.GL_CLAMP_TO_EDGE)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+
     def _set_filtering(self, device_zoom: float) -> None:
         minify = GL.GL_LINEAR
         if device_zoom < MIPMAP_BELOW_ZOOM:
@@ -273,6 +310,12 @@ class Viewer(QOpenGLWidget):
         GL.glUniform1i(u["showClipping"], int(self.show_clipping))
         GL.glUniform3f(u["clipOver"], *palette.CLIP_OVER.getRgbF()[:3])
         GL.glUniform3f(u["clipUnder"], *palette.CLIP_UNDER.getRgbF()[:3])
+        GL.glUniform1i(u["displayLut"], 1)
+        lut = self.display_lut
+        GL.glUniform1i(u["lutShaper"], int(lut is not None and lut.shaper == "log"))
+        GL.glUniform1f(u["lutMin"], lut.domain_min if lut else 0.0)
+        GL.glUniform1f(u["lutMax"], lut.domain_max if lut else 1.0)
+        GL.glUniform1f(u["lutSize"], float(lut.table.shape[0]) if lut else 1.0)
 
     def paintGL(self) -> None:
         ratio = self.devicePixelRatioF()
@@ -280,11 +323,16 @@ class Viewer(QOpenGLWidget):
         GL.glViewport(0, 0, view_w, view_h)
         GL.glClearColor(*palette.VIEWPORT.getRgbF()[:3], 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        if self._lut_pending and self.display_lut is not None:
+            self._upload_lut(self.display_lut)
+            self._lut_pending = False
         if self._upload_pending and self.frame is not None:
             self._upload(self.frame)
             self._upload_pending = False
         if self.frame is not None and self._texture_signature is not None:
             GL.glUseProgram(self._program)
+            GL.glActiveTexture(GL.GL_TEXTURE1)
+            GL.glBindTexture(GL.GL_TEXTURE_3D, self._lut_texture)
             GL.glActiveTexture(GL.GL_TEXTURE0)
             GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
             self._set_filtering(self.zoom * ratio)

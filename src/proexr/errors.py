@@ -8,3 +8,7 @@ class UnsupportedMediaError(ProexrError):
 
 class MediaReadError(ProexrError):
     pass
+
+
+class ColorConfigError(ProexrError):
+    pass

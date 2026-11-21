@@ -35,6 +35,7 @@ from . import palette, shortcuts
 from .color_panel import ColorPanel
 from .info_panel import InfoPanel
 from .media_list import MediaList
+from .ocio_panel import OcioPanel
 from .timeline import Timeline
 from .transport_bar import SPEEDS, TransportBar
 from .viewer import Channel, Viewer, ViewTransform
@@ -48,7 +49,7 @@ EMPTY_HINT = "Drop images, EXR sequences, videos or folders here\n\nCtrl+O open 
 FILE_FILTER = ("Media (*.exr *.sxr *.png *.jpg *.jpeg *.tif *.tiff *.tga *.dpx *.cin *.hdr *.bmp *.psd *.webp "
                "*.jp2 *.jxl *.mp4 *.mov *.avi *.mkv *.mxf *.webm *.m4v *.mpg *.ts);;All files (*)")
 CHANNEL_NAMES = ("RGB", "Red", "Green", "Blue", "Alpha", "Luminance")
-VIEW_NAMES = ("Raw", "sRGB", "Rec.709", "ACES filmic")
+VIEW_NAMES = ("Raw", "sRGB", "Rec.709", "ACES filmic (approx)", "OCIO")
 
 
 def total_memory_bytes() -> int:
@@ -178,9 +179,16 @@ class MainWindow(QMainWindow):
         self.color_panel = ColorPanel()
         self.color_panel.gradeChanged.connect(self._apply_grade)
         self.info_panel = InfoPanel()
+        self.ocio_panel = OcioPanel(self.settings.value("ocio_config"), self.settings.value("ocio_display"),
+                                    self.settings.value("ocio_view"))
+        self.ocio_panel.lutChanged.connect(self._apply_display_lut)
+        self.viewer.set_display_lut(self.ocio_panel.current_lut())
         self.media_dock = self._add_dock("Media", self.media_list, Qt.LeftDockWidgetArea, "media_dock")
         self.color_dock = self._add_dock("Color", self.color_panel, Qt.RightDockWidgetArea, "color_dock")
+        self.ocio_dock = self._add_dock("Color management", self.ocio_panel, Qt.RightDockWidgetArea, "ocio_dock")
         self.info_dock = self._add_dock("Info", self.info_panel, Qt.RightDockWidgetArea, "info_dock")
+        self.tabifyDockWidget(self.color_dock, self.ocio_dock)
+        self.color_dock.raise_()
         self.media_list.setMinimumWidth(230)
         self.color_panel.setMinimumWidth(320)
         self.resizeDocks([self.media_dock, self.color_dock], [250, 340], Qt.Horizontal)
@@ -282,6 +290,7 @@ class MainWindow(QMainWindow):
         panels = view_menu.addMenu("Panels")
         panels.addAction(self.media_dock.toggleViewAction())
         panels.addAction(self.color_dock.toggleViewAction())
+        panels.addAction(self.ocio_dock.toggleViewAction())
         panels.addAction(self.info_dock.toggleViewAction())
         reset_layout = QAction("Reset layout", self)
         reset_layout.triggered.connect(self._reset_layout)
@@ -380,6 +389,7 @@ class MainWindow(QMainWindow):
         self.transport.fps_box.blockSignals(False)
         self.timeline.set_range(source.first, source.last, source.fps, source.missing_frames)
         self.info_panel.show_properties(source.properties)
+        self.ocio_panel.set_source(source)
         self.setWindowTitle(f"{source.label} - ProEXR Viewer")
         self._sync_range()
         self._show(source.first, wait=True)
@@ -525,6 +535,9 @@ class MainWindow(QMainWindow):
 
     def _set_view_transform(self, index: int) -> None:
         self.viewer.view_transform = ViewTransform(index)
+        if self.viewer.view_transform is ViewTransform.OCIO:
+            self.ocio_dock.show()
+            self.ocio_dock.raise_()
         self.settings.setValue("view_transform", index)
         self.viewer.update()
 
@@ -534,6 +547,12 @@ class MainWindow(QMainWindow):
             field.blockSignals(True)
             field.setValue(grade[key])
             field.blockSignals(False)
+
+    def _apply_display_lut(self, lut) -> None:
+        self.viewer.set_display_lut(lut)
+        self.settings.setValue("ocio_config", self.ocio_panel.config_source)
+        self.settings.setValue("ocio_display", self.ocio_panel.display_box.currentText())
+        self.settings.setValue("ocio_view", self.ocio_panel.view_box.currentText())
 
     def _set_overlay(self, name: str, enabled: bool) -> None:
         self.viewer.overlays[name] = enabled
@@ -593,7 +612,7 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
 
     def toggle_panels(self) -> None:
-        docks = (self.media_dock, self.color_dock, self.info_dock)
+        docks = (self.media_dock, self.color_dock, self.ocio_dock, self.info_dock)
         hiding = self.view_bar.isVisible()
         if hiding:
             self._docks_before_hide = [d for d in docks if d.isVisible()]
@@ -606,7 +625,9 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea, self.media_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.color_dock)
         self.addDockWidget(Qt.RightDockWidgetArea, self.info_dock)
-        for dock in (self.media_dock, self.color_dock, self.info_dock):
+        self.addDockWidget(Qt.RightDockWidgetArea, self.ocio_dock)
+        self.tabifyDockWidget(self.color_dock, self.ocio_dock)
+        for dock in (self.media_dock, self.color_dock, self.ocio_dock, self.info_dock):
             dock.setFloating(False)
             dock.show()
 

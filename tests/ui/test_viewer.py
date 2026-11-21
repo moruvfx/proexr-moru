@@ -85,3 +85,21 @@ def test_widget_to_image_maps_center(viewer, qapp):
     from PySide6.QtCore import QPointF
     x, y = viewer.widget_to_image(QPointF(200, 120))
     assert (x, y) == pytest.approx((30, 20), abs=0.5)
+
+
+def test_ocio_lut_view_matches_baked_transform(viewer, qapp):
+    from proexr.color.ocio_pipeline import ColorManagement
+    color = ColorManagement.load("ocio://default")
+    viewer.set_display_lut(color.bake("Linear Rec.709 (sRGB)", "sRGB - Display", "Un-tone-mapped"))
+    viewer.view_transform = ViewTransform.OCIO
+    viewer.show_frame(solid([0.18, 0.18, 0.18, 1.0]))
+    assert center(viewer, qapp) == pytest.approx((118, 118, 118), abs=2)
+
+
+def test_ocio_view_keeps_display_referred_source_unchanged(viewer, qapp):
+    from proexr.color.ocio_pipeline import ColorManagement
+    color = ColorManagement.load("ocio://default")
+    viewer.set_display_lut(color.bake("sRGB Encoded Rec.709 (sRGB)", "sRGB - Display", "Un-tone-mapped"))
+    viewer.view_transform = ViewTransform.OCIO
+    viewer.show_frame(solid([200, 100, 30], np.uint8, "srgb", 3))
+    assert center(viewer, qapp) == pytest.approx((200, 100, 30), abs=3)

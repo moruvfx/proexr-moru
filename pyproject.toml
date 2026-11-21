@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=1.26",
     "OpenImageIO>=3.0",
     "av>=14.0",
+    "opencolorio>=2.3",
 ]
 
 [project.scripts]

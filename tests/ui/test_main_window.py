@@ -106,3 +106,14 @@ def test_user_shortcut_file_overrides_defaults(tmp_path, monkeypatch):
     keys = shortcuts.load()
     assert keys["toggle_play"] == ["P", "Space"]
     assert keys["next_frame"] == ["Right"]
+
+
+def test_ocio_view_bakes_lut_for_media_input(window, qapp, exr_sequence):
+    window.open_paths([str(exr_sequence)])
+    assert wait_for(qapp, lambda: window.viewer.frame is not None)
+    window.view_box.setCurrentText("OCIO")
+    assert window.ocio_panel.input_box.currentText() == "Linear Rec.709 (sRGB)"
+    window.ocio_panel.view_box.setCurrentText("Un-tone-mapped")
+    assert window.viewer.view_transform.name == "OCIO"
+    assert window.viewer.display_lut is not None
+    assert window.viewer.display_lut.shaper == "log"
