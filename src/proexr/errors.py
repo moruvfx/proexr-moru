@@ -16,3 +16,7 @@ class ColorConfigError(ProexrError):
 
 class PlaylistError(ProexrError):
     """A playlist file could not be read or written."""
+
+
+class UpdateError(ProexrError):
+    """Checking for or downloading an update failed."""

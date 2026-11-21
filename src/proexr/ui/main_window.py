@@ -1,3 +1,6 @@
+import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -23,9 +26,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__
+from .. import __version__, update
 from ..analysis.scopes import pixel_report
-from ..errors import MediaReadError, PlaylistError, ProexrError
+from ..errors import MediaReadError, PlaylistError, ProexrError, UpdateError
 from ..media.audio import AudioTrack, has_audio
 from ..media.frame import MediaSource
 from ..media.opener import open_media
@@ -51,6 +54,8 @@ DEFAULT_CACHE_SHARE = 0.3
 MAX_DEFAULT_CACHE_GB = 16
 STATUS_INTERVAL_MS = 250
 MEMORY_CHECK_INTERVAL_MS = 2000
+UPDATE_CHECK_DELAY_MS = 4000
+UPDATE_CHECK_EVERY_SECONDS = 24 * 3600
 LAYOUT_VERSION = 2  # bump whenever docks are added or removed so stale saved layouts are ignored
 SCOPE_INTERVAL_MS = 120
 SCOPE_SAMPLE_WIDTH = 384
@@ -68,6 +73,11 @@ VIEW_NAMES = ("Raw", "sRGB", "Rec.709", "ACES filmic (approx)", "OCIO")
 
 class FrameReadyRelay(QObject):
     ready = Signal(object)
+
+
+class UpdateRelay(QObject):
+    checked = Signal(object, bool)  # Release or error message, whether the user asked
+    downloaded = Signal(object)  # installer Path or error message
 
 
 class MainWindow(QMainWindow):
@@ -123,6 +133,11 @@ class MainWindow(QMainWindow):
         self._memory_timer = QTimer(self)
         self._memory_timer.timeout.connect(self._adapt_cache_to_memory)
         self._memory_timer.start(MEMORY_CHECK_INTERVAL_MS)
+        self._update_relay = UpdateRelay()
+        self._update_relay.checked.connect(self._update_checked, Qt.QueuedConnection)
+        self._update_relay.downloaded.connect(self._update_downloaded, Qt.QueuedConnection)
+        if self.settings.value("auto_update", True, type=bool):
+            QTimer.singleShot(UPDATE_CHECK_DELAY_MS, lambda: self.check_for_updates(user_asked=False))
         if self.settings.value("geometry") is not None:
             self.restoreGeometry(self.settings.value("geometry"))
         if self.settings.value("window_state") is not None:
@@ -385,6 +400,13 @@ class MainWindow(QMainWindow):
         edit_keys = QAction("Edit shortcuts file...", self)
         edit_keys.triggered.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(shortcuts.shortcuts_path()))))
         help_menu.addAction(edit_keys)
+        check = QAction("Check for updates...", self)
+        check.triggered.connect(lambda: self.check_for_updates(user_asked=True))
+        help_menu.addAction(check)
+        auto = QAction("Check for updates automatically", self, checkable=True,
+                       checked=self.settings.value("auto_update", True, type=bool))
+        auto.toggled.connect(lambda on: self.settings.setValue("auto_update", on))
+        help_menu.addAction(auto)
         about = QAction("About", self)
         about.triggered.connect(self._show_about)
         help_menu.addAction(about)
@@ -887,6 +909,55 @@ class MainWindow(QMainWindow):
     def _show_about(self) -> None:
         QMessageBox.about(self, "ProEXR Viewer", f"<b>ProEXR Viewer</b> {__version__}<br>Read-only VFX media viewer."
                           f"<br><br>GPU: {self.viewer.gl_renderer}")
+
+    def check_for_updates(self, user_asked: bool) -> None:
+        now = time.time()
+        if not user_asked and now - self.settings.value("last_update_check", 0.0, type=float) < UPDATE_CHECK_EVERY_SECONDS:
+            return
+        self.settings.setValue("last_update_check", now)
+
+        def work() -> None:
+            try:
+                self._update_relay.checked.emit(update.fetch_latest_release(), user_asked)
+            except UpdateError as error:
+                self._update_relay.checked.emit(str(error), user_asked)
+        threading.Thread(target=work, daemon=True, name="update-check").start()
+
+    def _update_checked(self, result, user_asked: bool) -> None:
+        if isinstance(result, str):
+            if user_asked:
+                QMessageBox.warning(self, "Check for updates", f"Could not check for updates.\n{result}")
+            return
+        if not update.is_newer(result.version):
+            if user_asked:
+                QMessageBox.information(self, "Check for updates", f"ProEXR Viewer {__version__} is up to date.")
+            return
+        can_install = sys.platform == "win32" and getattr(sys, "frozen", False) and result.installer_url
+        question = (f"ProEXR Viewer {result.version} is available (you have {__version__}).\n\n"
+                    + ("Download and install it now? The viewer will close and reopen." if can_install
+                       else "Open the download page?"))
+        if QMessageBox.question(self, "Update available", question) != QMessageBox.Yes:
+            return
+        if not can_install:
+            QDesktopServices.openUrl(QUrl(result.page_url))
+            return
+        self.statusBar().showMessage(f"Downloading ProEXR Viewer {result.version}...")
+
+        def work() -> None:
+            try:
+                self._update_relay.downloaded.emit(update.download_installer(result))
+            except UpdateError as error:
+                self._update_relay.downloaded.emit(str(error))
+        threading.Thread(target=work, daemon=True, name="update-download").start()
+
+    def _update_downloaded(self, result) -> None:
+        self.statusBar().clearMessage()
+        if isinstance(result, str):
+            QMessageBox.warning(self, "Update", f"Download failed.\n{result}")
+            return
+        subprocess.Popen([str(result), "/SILENT", "/SP-", "/NOCANCEL", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
+                         close_fds=True)
+        self.close()
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():

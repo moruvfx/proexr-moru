@@ -4,31 +4,35 @@ Professional, read-only media viewer and player for VFX artists, compositors and
 Opens EXR (multi-layer, multi-part), DPX, TIFF, TGA, HDR, PNG, JPEG, image sequences and video
 (MP4, MOV, ProRes, H.264, H.265, MKV, AVI...). Source files are never modified.
 
-## Run on Windows
+## Install on Windows
 
-1. Install Python 3.11 or newer from python.org (tick "Add python.exe to PATH").
-2. Install uv once, in PowerShell: `py -m pip install uv`
-3. In the project folder:
+Download `ProEXR-Viewer-Setup-x.y.z.exe` from [Releases](https://github.com/moruvfx/proexr-moru/releases/latest),
+run it and start ProEXR Viewer from the Desktop shortcut. No Python needed; it installs for your user only
+(no admin prompt). The app checks for new versions once a day and offers to install them
+(Help > Check for updates). A portable `.zip` is attached to each release too.
+
+## Run from source
 
 ```powershell
+py -m pip install uv
 uv sync
-uv run proexr                       # empty window, drop files or folders in
 uv run proexr D:\shots\sh010\comp.1001.exr D:\refs\edit.mov
 ```
 
-Without uv: `py -m venv .venv`, `.venv\Scripts\activate`, `pip install -e .`, then `proexr`.
-
-## What it does (phase 1)
+## Features
 
 - Image sequences are detected automatically (`shot.1001.exr`, `plate_0001.dpx`...); gaps hold the previous frame and show red on the timeline.
 - EXR layers and passes appear in the Layer menu; channels RGB, R, G, B, A and luminance.
-- Exposure, gamma, gain, offset, contrast, saturation and colour balance are applied on the GPU in real time.
-- View transforms: Raw, sRGB, Rec.709, ACES filmic (approximation). Full OCIO comes in phase 2.
-- Smooth playback: frames are decoded ahead of the playhead on worker threads into a RAM cache (green bar on the timeline). Realtime mode skips late frames, otherwise every frame is shown.
+- GPU colour: exposure, gamma, gain, offset, contrast, saturation and colour balance in real time.
+- Colour management: OCIO with the built-in ACES 2.1 CG and Studio configs or any `config.ocio`; input, display and view per media.
+- Compare A/B: B only, wipe (drag the line), side by side, difference. Right-click a media item to set it as B; Ctrl+B cycles B, `\` toggles.
+- Scopes: waveform, RGB parade, histogram, vectorscope; Pixel panel with exact values and a 5x5 average.
+- Smooth playback: frames are decoded ahead of the playhead on worker threads into a RAM cache (green bar on the timeline) that shrinks when free RAM runs low. Float images are cached as half to fit twice as many frames.
+- Video decoding on the GPU (NVIDIA NVDEC, D3D11) when available, CPU otherwise; the status bar shows which. Audio plays during forward 1x playback (M mutes).
 - Play forward/reverse, loop, ping-pong, play once, in/out points, speed 0.1x-4x, any frame rate.
-- Zoom (wheel), pan (drag), fit (F), 1:1 pixels (1), safe areas, thirds grid, clipping highlight, full screen, hide panels (Tab).
-- Pixel values under the cursor in the status bar; file metadata in the Info panel.
-- Dockable panels; the layout is remembered.
+- Browser panel with thumbnails; playlists (File > Save/Open playlist).
+- Zoom (wheel), pan (drag), fit (F), 1:1 pixels (1), safe areas, thirds grid, aspect guides (2.39, 1.85, 16:9...), clipping highlight, full screen, hide panels (Tab).
+- Dockable panels; the layout is remembered. Source files are only ever read.
 
 ## Shortcuts
 
@@ -40,6 +44,19 @@ Help > Keyboard shortcuts lists all of them; Help > Edit shortcuts file remaps a
 
 - Settings > Frame cache size: RAM used for decoded frames (default 30% of RAM, at most 16 GB).
 - Settings > Hardware video decoding: NVDEC/D3D11 when the FFmpeg build supports it, software otherwise.
+- Settings > Clear frame cache frees the RAM held by decoded frames.
+
+## Build the installer
+
+GitHub Actions (`.github/workflows/build-windows.yml`) builds on every push and publishes a release for `v*` tags
+or a manual run with "release" ticked. Locally on Windows:
+
+```powershell
+uv sync --group build
+uv run python packaging/write_version_info.py
+uv run pyinstaller packaging/proexr.spec --noconfirm
+iscc /DAppVersion=0.2.0 packaging\installer.iss     # Inno Setup 6
+```
 
 ## Development
 

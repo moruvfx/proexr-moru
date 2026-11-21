@@ -1,6 +1,6 @@
 [project]
 name = "proexr"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Professional read-only media viewer and player for VFX: EXR, image sequences and video"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,10 +22,14 @@ proexr-gui = "proexr.app:main"
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]
+build = ["pyinstaller>=6.10"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/proexr/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/proexr"]
